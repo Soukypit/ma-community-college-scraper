@@ -159,56 +159,67 @@ def _scrape_acalog(
     seen_coids = set()
 
     for prefix in prefixes:
-        params   = "&filter[item_type]=3&filter[only_active]=1&filter[3]=1"
+        base_params = "&filter[item_type]=3&filter[only_active]=1&filter[3]=1"
         if prefix:
-            params += f"&filter[prefix]={prefix}"
-        list_url = base_url + params
+            base_params += f"&filter[prefix]={prefix}"
 
-        try:
-            r = get(list_url, verify=verify_ssl)
-            s = make_soup(r)
-        except Exception as e:
-            print(f"    prefix {prefix!r}: {e}")
-            continue
-
-        links = (
-            s.select("a[href*='preview_course_nopop.php']") or
-            s.select("a[href*='preview_course.php']")
-        )
-
-        new_links = []
-        for a in links:
-            m    = re.search(r"coid=(\d+)", a["href"])
-            coid = m.group(1) if m else a["href"]
-            if coid not in seen_coids:
-                seen_coids.add(coid)
-                new_links.append(a)
-
-        print(f"    {prefix or '(all)'}: {len(new_links)} new courses")
-
-        for a in new_links:
-            href       = a["href"]
-            raw_title  = a.get_text(strip=True)
-            detail_url = (
-                href if href.startswith("http")
-                else f"https://{host}/{href.lstrip('/')}"
-            )
+        # Paginate: Acalog shows up to 100 results per page by default.
+        # Keep fetching filter[cpage]=1,2,3... until a page yields no new links.
+        page = 1
+        while True:
+            page_param = f"&filter[cpage]={page}" if page > 1 else ""
+            list_url   = base_url + base_params + page_param
 
             try:
-                rd = get(detail_url, verify=verify_ssl)
-                code, credits, desc, prereqs = _parse_acalog_detail(make_soup(rd))
+                r = get(list_url, verify=verify_ssl)
+                s = make_soup(r)
             except Exception as e:
-                print(f"      detail error ({raw_title[:40]}): {e}")
-                code = credits = desc = prereqs = ""
+                print(f"    prefix {prefix!r} page {page}: {e}")
+                break
 
-            courses.append({
-                "College":       college_name,
-                "Code":          code or _extract_code(raw_title),
-                "Title":         raw_title,
-                "Credits":       credits,
-                "Description":   desc,
-                "Prerequisites": prereqs,
-            })
+            links = (
+                s.select("a[href*='preview_course_nopop.php']") or
+                s.select("a[href*='preview_course.php']")
+            )
+
+            new_links = []
+            for a in links:
+                m    = re.search(r"coid=(\d+)", a["href"])
+                coid = m.group(1) if m else a["href"]
+                if coid not in seen_coids:
+                    seen_coids.add(coid)
+                    new_links.append(a)
+
+            print(f"    {prefix or '(all)'} p{page}: {len(new_links)} new courses")
+
+            for a in new_links:
+                href       = a["href"]
+                raw_title  = a.get_text(strip=True)
+                detail_url = (
+                    href if href.startswith("http")
+                    else f"https://{host}/{href.lstrip('/')}"
+                )
+
+                try:
+                    rd = get(detail_url, verify=verify_ssl)
+                    code, credits, desc, prereqs = _parse_acalog_detail(make_soup(rd))
+                except Exception as e:
+                    print(f"      detail error ({raw_title[:40]}): {e}")
+                    code = credits = desc = prereqs = ""
+
+                courses.append({
+                    "College":       college_name,
+                    "Code":          code or _extract_code(raw_title),
+                    "Title":         raw_title,
+                    "Credits":       credits,
+                    "Description":   desc,
+                    "Prerequisites": prereqs,
+                })
+
+            # Stop if this page had no new links (we've exhausted this prefix)
+            if not new_links:
+                break
+            page += 1
 
     return courses
 
