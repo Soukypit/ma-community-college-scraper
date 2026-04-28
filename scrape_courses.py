@@ -54,7 +54,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-REQUEST_DELAY = 1.5   # seconds between HTTP requests — be polite
+REQUEST_DELAY = 0.5   # seconds between HTTP requests
 OUTPUT_FILE   = "transfer_courses.xlsx"
 
 HEADERS = {
@@ -192,7 +192,7 @@ def _scrape_acalog(
 
             print(f"    {prefix or '(all)'} p{page}: {len(new_links)} new courses")
 
-            for a in new_links:
+            for i, a in enumerate(new_links, 1):
                 href       = a["href"]
                 raw_title  = a.get_text(strip=True)
                 detail_url = (
@@ -200,11 +200,13 @@ def _scrape_acalog(
                     else f"https://{host}/{href.lstrip('/')}"
                 )
 
+                print(f"      [{i}/{len(new_links)}] {raw_title[:60]}", flush=True)
+
                 try:
                     rd = get(detail_url, verify=verify_ssl)
                     code, credits, desc, prereqs = _parse_acalog_detail(make_soup(rd))
                 except Exception as e:
-                    print(f"      detail error ({raw_title[:40]}): {e}")
+                    print(f"      ✗ detail error: {e}")
                     code = credits = desc = prereqs = ""
 
                 courses.append({
