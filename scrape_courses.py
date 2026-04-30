@@ -45,6 +45,7 @@ import os
 import re
 import string
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
@@ -645,29 +646,61 @@ def main() -> None:
         help="Scrape only one college (omit to scrape all)",
     )
     parser.add_argument(
+        "--colleges",
+        nargs="+",
+        choices=list(ALL_SCRAPERS.keys()),
+        metavar="KEY",
+        help="Scrape multiple colleges, e.g. --colleges bhcc middlesex",
+    )
+    parser.add_argument(
         "--output", default=OUTPUT_FILE,
         help=f"Output .xlsx path (default: {OUTPUT_FILE})",
     )
+    parser.add_argument(
+        "--parallel", action="store_true",
+        help="Scrape colleges in parallel (faster for multiple colleges)",
+    )
     args = parser.parse_args()
 
-    targets = (
-        {args.college: ALL_SCRAPERS[args.college]}
-        if args.college
-        else ALL_SCRAPERS
-    )
+    if args.colleges:
+        targets = {k: ALL_SCRAPERS[k] for k in args.colleges}
+    elif args.college:
+        targets = {args.college: ALL_SCRAPERS[args.college]}
+    else:
+        targets = ALL_SCRAPERS
 
     all_courses: list[dict] = []
 
-    for key, (name, fn) in targets.items():
-        print(f"\n{'─' * 60}")
-        print(f"Scraping: {name}")
-        print(f"{'─' * 60}")
-        try:
-            courses = fn()
-            print(f"  ✓  {len(courses)} courses collected")
-            all_courses.extend(courses)
-        except Exception as e:
-            print(f"  ✗  Scraper failed: {e}")
+    if args.parallel and len(targets) > 1:
+        print(f"Running {len(targets)} colleges in parallel…\n")
+        results: dict[str, list[dict]] = {}
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            future_to_name = {
+                executor.submit(fn): name
+                for (name, fn) in targets.values()
+            }
+            for future in as_completed(future_to_name):
+                college_name = future_to_name[future]
+                try:
+                    courses = future.result()
+                    results[college_name] = courses
+                    print(f"  ✓  {college_name}: {len(courses)} courses collected")
+                except Exception as e:
+                    print(f"  ✗  {college_name}: scraper failed: {e}")
+                    results[college_name] = []
+        for name, _ in targets.values():
+            all_courses.extend(results.get(name, []))
+    else:
+        for (name, fn) in targets.values():
+            print(f"\n{'─' * 60}")
+            print(f"Scraping: {name}")
+            print(f"{'─' * 60}")
+            try:
+                courses = fn()
+                print(f"  ✓  {len(courses)} courses collected")
+                all_courses.extend(courses)
+            except Exception as e:
+                print(f"  ✗  Scraper failed: {e}")
 
     if not all_courses:
         print("\nNo courses collected — nothing to write.")
