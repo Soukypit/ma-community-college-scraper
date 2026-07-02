@@ -15,20 +15,30 @@ Colleges implemented
   Clean Catalog:
     - Bristol Community College        (catalog.bristolcc.edu)
 
-  CourseDog API:
+  CourseDog CSV export:
     - Greenfield Community College     (catalog.gcc.mass.edu)
 
   Static HTML:
     - Roxbury Community College        (rcc.mass.edu)
 
+  Server-rendered HTML (GET form):
+    - Massasoit Community College          (massasoit.edu/academics/course-search.html)
+
+  Static HTML catalog (Acalog-style):
+    - Mount Wachusett Community College    (catalog.mwcc.edu/coursedescriptions/)
+
+  Internal JSON API:
+    - North Shore Community College        (northshore.edu/_course-api/v1/courses.php)
+
+  Drupal Views HTML + detail pages:
+    - Quinsigamond Community College       (qcc.edu/classes)
+
+  Course Search Tool XML API:
+    - Northern Essex Community College     (cst.necc.mass.edu/get_courses)
+
   Stubs (catalog URL research needed):
     - Berkshire Community College
     - Cape Cod Community College
-    - Massasoit Community College
-    - Mount Wachusett Community College
-    - North Shore Community College
-    - Northern Essex Community College
-    - Quinsigamond Community College
 
 Setup:
     pip install -r requirements.txt
@@ -41,11 +51,13 @@ Run a single college (useful for testing):
 """
 
 import argparse
+import csv
+import html
+import io
 import os
 import re
 import string
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
@@ -90,7 +102,7 @@ def _extract_code(text: str) -> str:
 
 
 def _extract_credits(text: str) -> str:
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:Credit|Unit|Hour)", text, re.I)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:Credit(?:\s*Hour)?|Unit)s?\b", text, re.I)
     return m.group(1) if m else ""
 
 
@@ -299,30 +311,43 @@ def scrape_bristol() -> list[dict]:
     seen    = set()
 
     for letter in string.ascii_lowercase:
-        url = f"{BASE}/classes/{letter}"
-        try:
-            r = get(url)
-            s = make_soup(r)
-        except Exception as e:
-            print(f"  [Bristol] /{letter}: {e}")
-            continue
+        page = 0
+        while True:
+            url = f"{BASE}/classes/{letter}" + (f"?page={page}" if page else "")
+            try:
+                r = get(url)
+                s = make_soup(r)
+            except Exception as e:
+                print(f"  [Bristol] /{letter} page {page}: {e}")
+                break
 
-        # Course links look like /accounting/acc-101 (two path segments)
-        for a in s.select("a[href]"):
-            href = a["href"]
-            if (
-                re.match(r"^/[a-z][a-z0-9-]+/[a-z]{2,5}-\d{3,4}", href)
-                and href not in seen
-            ):
-                seen.add(href)
-                detail_url = BASE + href
-                try:
-                    rd = get(detail_url)
-                    c  = _parse_cleancatalog_detail(make_soup(rd))
-                    c["College"] = "Bristol Community College"
-                    courses.append(c)
-                except Exception as e:
-                    print(f"  [Bristol] detail error {href}: {e}")
+            new_on_page = 0
+            # Course links look like /accounting/acc-101 (two path segments)
+            for a in s.select("a[href]"):
+                href = str(a["href"])
+                if (
+                    re.match(r"^/[a-z][a-z0-9-]+/[a-z]{2,5}-\d{3,4}", href)
+                    and href not in seen
+                ):
+                    seen.add(href)
+                    new_on_page += 1
+                    detail_url = BASE + href
+                    try:
+                        rd = get(detail_url)
+                        c  = _parse_cleancatalog_detail(make_soup(rd))
+                        c["College"] = "Bristol Community College"
+                        courses.append(c)
+                    except Exception as e:
+                        print(f"  [Bristol] detail error {href}: {e}")
+
+            # Stop paging when no new courses appear or no "Load More" link
+            has_more = any(
+                "page=" in str(a.get("href", "")) for a in s.select("a[href]")
+                if "load" in a.get_text(strip=True).lower() or "more" in a.get_text(strip=True).lower()
+            )
+            if not new_on_page or not has_more:
+                break
+            page += 1
 
         print(f"  [Bristol] /classes/{letter}: {len(seen)} courses total")
 
@@ -334,13 +359,31 @@ def _parse_cleancatalog_detail(s: BeautifulSoup) -> dict:
     raw = h1.get_text(" ", strip=True) if h1 else ""
 
     # Typical heading: "ACC 101 : Principles of Accounting I"
-    m     = re.match(r"([A-Z]{2,5}[-\s]\d{3,4}[A-Z]?)\s*[:\-]\s*(.*)", raw)
+    m     = re.match(r"([A-Z]{2,5}[-\s]?\d{3,4}[A-Z]?)\s*[:\-]\s*(.*)", raw)
     code  = m.group(1).strip() if m else _extract_code(raw)
     title = m.group(2).strip() if m else raw
 
-    # Credits — Clean Catalog puts a numeric value near a "Credits" label
+    # Credits — Clean Catalog renders "Credits" as a label with the number
+    # in the next sibling element (label-value layout, not "4 Credits" inline)
     full_text = s.get_text(" ")
-    credits   = _extract_credits(full_text)
+
+    credits = ""
+    for lbl in s.find_all(string=re.compile(r"^\s*Credits?\s*$", re.I)):
+        parent = lbl.parent
+        if parent is None:
+            continue
+        grandparent = parent.parent
+        val_el = parent.find_next_sibling() or (
+            grandparent.find_next_sibling() if grandparent is not None else None
+        )
+        if val_el is not None:
+            val = val_el.get_text(strip=True)
+            if re.match(r"^\d+(?:\.\d+)?$", val):
+                credits = val
+                break
+    if not credits:
+        mc = re.search(r"\bCredits?\b\s*:?\s*(\d+(?:\.\d+)?)", full_text, re.I)
+        credits = mc.group(1) if mc else _extract_credits(full_text)
 
     # Description — largest paragraph block
     paras = s.find_all("p")
@@ -355,22 +398,59 @@ def _parse_cleancatalog_detail(s: BeautifulSoup) -> dict:
     }
 
 
-# ── COURSEDOG API (Greenfield CC) ─────────────────────────────────────────────
+# ── CSV EXPORT (Greenfield CC) ────────────────────────────────────────────────
 
 def scrape_gcc() -> list[dict]:
     """
-    Greenfield CC uses CourseDog. Tries the REST API first; falls back to the
-    rendered HTML (which will be sparse since CourseDog is JS-heavy).
+    Greenfield CC (CourseDog catalog) exposes an "Export all results as CSV"
+    button. Try that URL directly; fall back to the CourseDog REST API.
     """
     BASE    = "https://catalog.gcc.mass.edu"
     courses = []
 
+    # CourseDog catalogs serve CSV exports at this endpoint
+    csv_candidates = [
+        f"{BASE}/courses?format=csv",
+        f"{BASE}/courses?export=csv",
+        f"{BASE}/courses/export.csv",
+    ]
+
+    for url in csv_candidates:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            ct = r.headers.get("content-type", "")
+            if r.status_code == 200 and ("csv" in ct or "text/plain" in ct or r.text.startswith('"') or "," in r.text[:200]):
+                reader = csv.DictReader(io.StringIO(r.text))
+                for row in reader:
+                    # CourseDog CSV columns vary; try common field names
+                    code  = row.get("Course Code") or row.get("Code") or row.get("courseNumber", "")
+                    title = row.get("Course Title") or row.get("Title") or row.get("name", "")
+                    cred  = row.get("Credits") or row.get("Units") or row.get("credits", "")
+                    desc  = row.get("Description") or row.get("description", "")
+                    prereq = row.get("Prerequisites") or row.get("prerequisites", "")
+                    if code or title:
+                        courses.append({
+                            "College":       "Greenfield Community College",
+                            "Code":          code.strip(),
+                            "Title":         title.strip(),
+                            "Credits":       str(cred).strip(),
+                            "Description":   desc.strip(),
+                            "Prerequisites": prereq.strip(),
+                        })
+                if courses:
+                    print(f"  [GCC] CSV export: {len(courses)} courses")
+                    return courses
+            time.sleep(REQUEST_DELAY)
+        except Exception:
+            pass
+
+    # Fall back to CourseDog REST API
+    print("  [GCC] CSV not available; trying API")
     api_candidates = [
         f"{BASE}/api/v1/courses?skip=0&limit=2000",
         f"{BASE}/api/v1/courses/search?skip=0&limit=2000",
         "https://app.coursedog.com/api/v1/cm/gcc/courses/$all?skip=0&limit=2000",
     ]
-
     for endpoint in api_candidates:
         try:
             r = requests.get(endpoint, headers=HEADERS, timeout=30)
@@ -392,25 +472,7 @@ def scrape_gcc() -> list[dict]:
         except Exception:
             pass
 
-    # HTML fallback — JS-rendered pages will return very little useful content
-    print("  [GCC] API unavailable; trying HTML (may be incomplete)")
-    try:
-        r = get(f"{BASE}/courses")
-        s = make_soup(r)
-        for block in s.select(".course-item, .course-block, [data-course-id]"):
-            text = block.get_text(" ", strip=True)
-            courses.append({
-                "College":       "Greenfield Community College",
-                "Code":          _extract_code(text),
-                "Title":         text[:120],
-                "Credits":       _extract_credits(text),
-                "Description":   "",
-                "Prerequisites": "",
-            })
-        print(f"  [GCC] HTML fallback: {len(courses)} courses")
-    except Exception as e:
-        print(f"  [GCC] HTML fallback failed: {e}")
-
+    print("  [GCC] all methods failed — no courses returned")
     return courses
 
 
@@ -491,60 +553,699 @@ def scrape_berkshire() -> list[dict]:
 
 def scrape_capecod() -> list[dict]:
     """
-    TODO: Cape Cod CC (capecod.edu)
-    Their site returns 403. Try:
-      https://www.capecod.edu/academics/programs-courses/
-    or check if they publish a PDF catalog.
+    Cape Cod CC uses Clean Catalog at live-capecod.cleancatalog.io.
+    All courses are at /classes with ?page=N pagination (no letter sub-paths).
+    Course hrefs use no hyphen: /accounting/acc100.
     """
-    print("  [Cape Cod CC] stub — site returned 403, manual inspection needed")
-    return []
+    BASE    = "https://live-capecod.cleancatalog.io"
+    courses = []
+    seen    = set()
+    page    = 0
+
+    while True:
+        url = f"{BASE}/classes" + (f"?page={page}" if page else "")
+        try:
+            r = get(url)
+            s = make_soup(r)
+        except Exception as e:
+            print(f"  [Cape Cod CC] page {page}: {e}")
+            break
+
+        new_on_page = 0
+        for a in s.select("a[href]"):
+            href = str(a["href"])
+            if (
+                re.match(r"^/[a-z][a-z0-9-]+/[a-z]{2,5}\d{3,4}", href)
+                and href not in seen
+            ):
+                seen.add(href)
+                new_on_page += 1
+                detail_url = BASE + href
+                try:
+                    rd = get(detail_url)
+                    c  = _parse_cleancatalog_detail(make_soup(rd))
+                    c["College"] = "Cape Cod Community College"
+                    courses.append(c)
+                except Exception as e:
+                    print(f"  [Cape Cod CC] detail error {href}: {e}")
+
+        print(f"  [Cape Cod CC] page {page}: {new_on_page} new courses ({len(seen)} total)")
+        if not new_on_page:
+            break
+        page += 1
+
+    return courses
 
 
 def scrape_massasoit() -> list[dict]:
     """
-    TODO: Massasoit CC
-    Course search at https://www.massasoit.edu/academics/course-search.html
-    Needs a browser DevTools inspection to find the underlying API endpoint.
+    Massasoit CC — server-rendered course search.
+    The form at /academics/course-search.html submits via GET to the same URL.
+    We discover available term values from the radio buttons, then scrape each
+    term for credit courses, deduplicating by course code so catalog entries
+    aren't repeated when a course runs in multiple terms.
     """
-    print("  [Massasoit CC] stub — course search API endpoint unknown")
-    return []
+    BASE = "https://www.massasoit.edu/academics/course-search.html"
+    courses = []
+    seen_codes: set[str] = set()
+
+    # Discover available terms from the page's radio buttons
+    try:
+        r = get(BASE)
+        s = make_soup(r)
+    except Exception as e:
+        print(f"  [Massasoit CC] failed to load base page: {e}")
+        return []
+
+    terms = [
+        str(inp["value"])
+        for inp in s.select('input[name="term"]')
+        if inp.get("value")
+    ]
+    if not terms:
+        print("  [Massasoit CC] no term options found")
+        return []
+
+    print(f"  [Massasoit CC] found terms: {terms}")
+
+    for term in terms:
+        url = f"{BASE}?term={str(term).replace(' ', '+')}&credits=GTZ"
+        try:
+            r = get(url)
+            s = make_soup(r)
+        except Exception as e:
+            print(f"  [Massasoit CC] term '{term}' fetch error: {e}")
+            continue
+
+        items = s.select("div.result-item")
+        new_this_term = 0
+        for item in items:
+            box = item.select_one("div.course-box")
+            if not box:
+                continue
+
+            strongs = box.select("p > strong")
+            if len(strongs) < 2:
+                continue
+
+            # First strong: "ACCT 104 - Fundamentals of Financial Reporting"
+            raw_title = strongs[0].get_text(" ", strip=True)
+            m = re.match(r"([A-Z]{2,6}\s*\d{3,4}[A-Z]?)\s*[-–]\s*(.*)", raw_title)
+            if m:
+                code  = m.group(1).strip()
+                title = m.group(2).strip()
+            else:
+                code  = ""
+                title = raw_title
+
+            if code in seen_codes:
+                continue
+
+            # Second strong: "Fall 2026 - 4 Credit Course"
+            raw_meta = strongs[1].get_text(" ", strip=True)
+            cred_m = re.search(r"(\d+(?:\.\d+)?)\s+Credit", raw_meta, re.I)
+            credits = cred_m.group(1) if cred_m else ""
+
+            desc_el = box.select_one("p.description")
+            description = desc_el.get_text(" ", strip=True) if desc_el else ""
+
+            # Strip trailing prerequisite labels added by JS (Pre/Co-requisites:)
+            description = re.sub(r"\s*(Pre/Co-|Pre|Co)requisites?:.*", "", description, flags=re.I | re.DOTALL).strip()
+
+            seen_codes.add(code)
+            new_this_term += 1
+            courses.append({
+                "College":       "Massasoit Community College",
+                "Code":          code,
+                "Title":         title,
+                "Credits":       credits,
+                "Description":   description,
+                "Prerequisites": "",
+            })
+
+        print(f"  [Massasoit CC] term '{term}': {new_this_term} new courses")
+
+    print(f"  [Massasoit CC] total unique courses: {len(courses)}")
+    return courses
 
 
 def scrape_mwcc() -> list[dict]:
     """
-    TODO: Mount Wachusett CC (mwcc.edu)
-    Uses Ellucian catalog. Find the catalog URL and scraping approach.
+    Mount Wachusett CC — Acalog-style static HTML catalog.
+    Index at /coursedescriptions/ lists ~59 department slugs (acc, bio, ...).
+    Each department page contains div.courseblock entries with:
+      p.courseblocktitle  → "CODE\xa0NUM.  Title.  N Credits."
+      p.courseblockdesc   → description text (may include prereqs inline)
     """
-    print("  [Mount Wachusett CC] stub — Ellucian catalog, research needed")
-    return []
+    BASE  = "https://catalog.mwcc.edu"
+    INDEX = f"{BASE}/coursedescriptions/"
+    courses = []
+
+    # Discover department slugs from the index page
+    try:
+        r = get(INDEX)
+        s = make_soup(r)
+    except Exception as e:
+        print(f"  [Mount Wachusett CC] failed to load index: {e}")
+        return []
+
+    dept_links = sorted({
+        str(a["href"])
+        for a in s.select('a[href^="/coursedescriptions/"]')
+        if re.match(r"^/coursedescriptions/[a-z]{2,4}/$", str(a["href"]))
+    })
+    print(f"  [Mount Wachusett CC] found {len(dept_links)} department pages")
+
+    for href in dept_links:
+        url = BASE + str(href)
+        try:
+            r = get(url)
+            s = make_soup(r)
+        except Exception as e:
+            print(f"  [Mount Wachusett CC] {href} error: {e}")
+            continue
+
+        for block in s.select("div.courseblock"):
+            title_el = block.select_one("p.courseblocktitle strong")
+            if not title_el:
+                continue
+
+            raw = title_el.get_text(" ", strip=True)
+            # Format: "ACC 101.  Principles of Accounting I.  3 Credits."
+            # Non-breaking spaces (\xa0) appear between code letters and number
+            raw = raw.replace("\xa0", " ")
+            m = re.match(
+                r"([A-Z]{2,6}\s+\d{3,4}[A-Z]?)\.\s+(.*?)\.\s+(\d+(?:\.\d+)?)\s+Credits?\.",
+                raw, re.I
+            )
+            if not m:
+                continue
+
+            code    = m.group(1).strip()
+            title   = m.group(2).strip()
+            credits = m.group(3).strip()
+
+            desc_el = block.select_one("p.courseblockdesc")
+            description = desc_el.get_text(" ", strip=True) if desc_el else ""
+
+            courses.append({
+                "College":       "Mount Wachusett Community College",
+                "Code":          code,
+                "Title":         title,
+                "Credits":       credits,
+                "Description":   description,
+                "Prerequisites": "",
+            })
+
+    print(f"  [Mount Wachusett CC] total courses: {len(courses)}")
+    return courses
 
 
 def scrape_northshore() -> list[dict]:
     """
-    TODO: North Shore CC (northshore.edu)
-    catalog.northshore.edu was unreachable. Try the main site or a direct
-    catalog PDF.
+    North Shore Community College (northshore.edu)
+    Uses the internal JSON API at /_course-api/v1/courses.php which returns
+    all credit and non-credit courses in one request.
     """
-    print("  [North Shore CC] stub — catalog URL unreachable")
-    return []
+    API_URL = "https://www.northshore.edu/_course-api/v1/courses.php"
 
+    print("  [North Shore CC] fetching course catalog …")
+    try:
+        r = get(API_URL)
+        data = r.json()
+    except Exception as e:
+        print(f"  [North Shore CC] API request failed: {e}")
+        return []
 
-def scrape_necc() -> list[dict]:
-    """
-    TODO: Northern Essex CC (necc.mass.edu)
-    catalog.necc.mass.edu was unreachable. Check for alternate catalog URL.
-    """
-    print("  [Northern Essex CC] stub — catalog URL unreachable")
-    return []
+    courses = []
+    for course in data.values():
+        if course.get("credits_type") != "credit":
+            continue
+
+        code   = f"{course['subject_code']} {course['number']}"
+        title  = course.get("title", "").strip()
+        credits = str(course.get("credits", "")).strip()
+        desc   = course.get("description", "").strip()
+
+        # Prerequisites are stored per-session but are consistent across them
+        sessions = course.get("sessions", [])
+        prereq = sessions[0].get("prerequisite", "").strip() if sessions else ""
+
+        courses.append({
+            "College":       "North Shore Community College",
+            "Code":          code,
+            "Title":         title,
+            "Credits":       credits,
+            "Description":   desc,
+            "Prerequisites": prereq,
+        })
+
+    print(f"  [North Shore CC] total credit courses: {len(courses)}")
+    return courses
 
 
 def scrape_qcc() -> list[dict]:
     """
-    TODO: Quinsigamond CC (qcc.mass.edu)
-    catalog.qcc.mass.edu was unreachable. Check for alternate catalog URL.
+    Quinsigamond Community College (qcc.edu)
+    The /classes page is a Drupal views table listing all courses with links
+    to individual detail pages at /courses/<slug>. Each detail page has
+    structured field__label / field__item elements for credits, description,
+    and prerequisites.
     """
-    print("  [Quinsigamond CC] stub — catalog URL unreachable")
-    return []
+    BASE = "https://www.qcc.edu"
+    INDEX_URL = BASE + "/classes"
+
+    print("  [Quinsigamond CC] loading course index …")
+    try:
+        r = get(INDEX_URL)
+        soup = make_soup(r)
+    except Exception as e:
+        print(f"  [Quinsigamond CC] index failed: {e}")
+        return []
+
+    # Collect (code, title, detail_href) from all views tables on the page
+    entries = []
+    for row in soup.select("table.views-table tr"):
+        code_td  = row.select_one("td.views-field-field-course-number")
+        title_td = row.select_one("td.views-field-title")
+        if not (code_td and title_td):
+            continue
+        a = title_td.select_one("a[href]")
+        if not a:
+            continue
+        entries.append((
+            code_td.get_text(strip=True),
+            a.get_text(strip=True),
+            a["href"],
+        ))
+
+    print(f"  [Quinsigamond CC] {len(entries)} courses found, fetching details …")
+
+    courses = []
+    for i, (code, title, href) in enumerate(entries, 1):
+        url = BASE + href if href.startswith("/") else href
+        try:
+            r = get(url)
+            detail = make_soup(r)
+        except Exception as e:
+            print(f"    [{i}/{len(entries)}] {code} error: {e}")
+            courses.append({
+                "College": "Quinsigamond Community College",
+                "Code": code, "Title": title,
+                "Credits": "", "Description": "", "Prerequisites": "",
+            })
+            continue
+
+        # Build a label→value map from Drupal field widgets
+        fields: dict[str, str] = {}
+        for field_div in detail.select("div.field"):
+            label_el = field_div.select_one(".field__label")
+            item_el  = field_div.select_one(".field__item")
+            if label_el and item_el:
+                fields[label_el.get_text(strip=True).lower()] = item_el.get_text(" ", strip=True)
+
+        # Description: the body div is itself the field__item (label-hidden pattern)
+        body_div = detail.select_one("div.field--name-body")
+        desc = body_div.get_text(" ", strip=True) if body_div else ""
+
+        if i % 50 == 0:
+            print(f"    {i}/{len(entries)} done …")
+
+        courses.append({
+            "College":       "Quinsigamond Community College",
+            "Code":          fields.get("course number", code),
+            "Title":         title,
+            "Credits":       fields.get("credits", ""),
+            "Description":   desc,
+            "Prerequisites": fields.get("prerequisites", ""),
+        })
+
+    print(f"  [Quinsigamond CC] total courses: {len(courses)}")
+    return courses
+
+def scrape_necc() -> list[dict]:
+    """
+    Northern Essex Community College (necc.edu)
+    Uses the Course Search Tool XML API at cst.necc.mass.edu/get_courses.
+    Queries every subject across all available terms, then deduplicates by
+    course code to build the most complete catalog.
+    """
+    BASE = "https://cst.necc.mass.edu"
+    import xml.etree.ElementTree as ET
+    import random
+
+    # Fetch subject codes
+    print("  [Northern Essex CC] loading subjects …")
+    try:
+        r = get(f"{BASE}/get_courses?rndData={random.random()}")
+        root = ET.fromstring(r.text)
+    except Exception as e:
+        print(f"  [Northern Essex CC] subject list failed: {e}")
+        return []
+
+    subjects = [
+        (row.findtext("STVSUBJ_CODE", "").strip(), row.findtext("STVSUBJ_DESC", "").strip())
+        for row in root.findall("ROW")
+        if row.findtext("STVSUBJ_CODE", "").strip()
+    ]
+    print(f"  [Northern Essex CC] {len(subjects)} subjects, querying all terms …")
+
+    # Query every subject across all available terms; deduplicate by code
+    TERMS = ["202601", "202509", "202609", "202605", "202605-11"]
+    seen: set[str] = set()
+    courses: list[dict] = []
+
+    for subj_code, subj_desc in subjects:
+        for term in TERMS:
+            try:
+                r = get(f"{BASE}/get_courses?rndData={random.random()}&term={term}&subject={subj_code}")
+                root = ET.fromstring(r.text)
+            except Exception as e:
+                print(f"    {subj_code} term={term} error: {e}")
+                continue
+
+            for row in root.iter("COURSES_ROW"):
+                code = (
+                    (row.findtext("SCBCRSE_SUBJ_CODE") or "").strip()
+                    + " "
+                    + (row.findtext("SCBCRSE_CRSE_NUMB") or "").strip()
+                ).strip()
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+
+                raw_title = (row.findtext("COURSE_TITLE") or "").strip()
+                # Format: "ACC101 - Intro Accounting I | 3 Credit Course"
+                title = re.sub(r"^[A-Z]{2,6}\d{3,4}[A-Z]?\s*[-–]\s*", "", raw_title)
+                title = re.sub(r"\s*\|\s*\d+(?:\.\d+)?\s*Credit\s+Course\s*$", "", title, flags=re.I).strip()
+
+                credits = (row.findtext("CREDIT_HOURS") or row.findtext("SCBCRSE_CREDIT_HR_LOW") or "").strip()
+                desc    = (row.findtext("COURSE_DESCRIPTION") or "").strip()
+                prereq  = (row.findtext("PREREQUISITES") or "").strip()
+
+                courses.append({
+                    "College":       "Northern Essex Community College",
+                    "Code":          code,
+                    "Title":         title,
+                    "Credits":       credits,
+                    "Description":   desc,
+                    "Prerequisites": prereq,
+                })
+
+        print(f"    {subj_code}: {sum(1 for c in courses if c['Code'].startswith(subj_code + ' '))} unique courses so far total={len(courses)}")
+
+    print(f"  [Northern Essex CC] total courses: {len(courses)}")
+    return courses
+
+# ── UMASS BOSTON (courses.umb.edu) ───────────────────────────────────────────
+
+UMB_TERM = "2026 Fall"
+
+
+def scrape_umb() -> list[dict]:
+    """
+    UMass Boston course catalog (courses.umb.edu).
+
+    /course_catalog/subjects/{term} lists all subjects (both ugrd and grd)
+    as links to /course_catalog/courses/{career}_{subject}_{term}.  Each
+    subject page links to individual course detail pages at
+    /course_catalog/course_info/{career}_{subject}_{term}_{number}.
+    """
+    BASE = "https://courses.umb.edu"
+
+    # Step 1: collect all subject page URLs for the term
+    print(f"  [UMB] loading subjects for {UMB_TERM} …")
+    try:
+        r = get(f"{BASE}/course_catalog/subjects/{UMB_TERM}")
+        s = make_soup(r)
+    except Exception as e:
+        print(f"  [UMB] subjects page failed: {e}")
+        return []
+
+    content = s.find(id="content") or s
+    subject_urls = list({
+        (a["href"] if a["href"].startswith("http") else BASE + a["href"])
+        for a in content.find_all("a", href=re.compile(r"/course_catalog/courses/"))
+    })
+    print(f"  [UMB] {len(subject_urls)} subjects found, collecting course links …")
+
+    # Step 2: for each subject page, collect course_info links
+    seen_urls: set = set()
+    for subject_url in subject_urls:
+        try:
+            rs = get(subject_url)
+            ss = make_soup(rs)
+        except Exception as e:
+            print(f"  [UMB] subject page failed ({subject_url}): {e}")
+            continue
+        for a in ss.find_all("a", href=re.compile(r"/course_catalog/course_info/")):
+            href = a["href"]
+            seen_urls.add(href if href.startswith("http") else BASE + href)
+
+    detail_list = list(seen_urls)
+    print(f"  [UMB] {len(detail_list)} unique courses found, fetching details …")
+
+    # Step 3: fetch each course detail page
+    courses = []
+    for i, detail_url in enumerate(detail_list, 1):
+        try:
+            rd = get(detail_url)
+            sd = make_soup(rd)
+        except Exception as e:
+            print(f"    [{i}/{len(detail_list)}] error: {e}")
+            continue
+
+        content_div = sd.find(id="content") or sd
+        full_text = content_div.get_text("\n", strip=True)
+
+        # Title is the last breadcrumb segment before the h1
+        h1 = content_div.find("h1") or content_div.find("h2")
+        title = h1.get_text(" ", strip=True) if h1 else ""
+
+        # "Course #: CS 105" or "Course #: SPE G 601"
+        code = ""
+        m = re.search(r"Course\s*#:\s*([A-Z]{2,8}(?:\s[A-Z]+)?\s*\d{3,4}[A-Z]?)", full_text)
+        if m:
+            code = m.group(1).strip()
+
+        desc = ""
+        m2 = re.search(r"Description:\s*\n(.+?)(?:\nPre Requisites:|\nSection\b)", full_text, re.S)
+        if m2:
+            desc = m2.group(1).strip()
+
+        prereqs = ""
+        m3 = re.search(r"Pre Requisites:\s*\n(.+?)(?:\nSection\b|\nCourse Attributes:|\Z)", full_text, re.S)
+        if m3:
+            prereqs = m3.group(1).strip()
+
+        credits = ""
+        m4 = re.search(r"Credits:\s*(\d+)", full_text)
+        if m4:
+            credits = m4.group(1)
+
+        if i % 50 == 0:
+            print(f"    {i}/{len(detail_list)} done …")
+
+        courses.append({
+            "College":       "University of Massachusetts Boston",
+            "Code":          code,
+            "Title":         title,
+            "Credits":       credits,
+            "Description":   desc,
+            "Prerequisites": prereqs,
+        })
+
+    print(f"  [UMB] total courses: {len(courses)}")
+    return courses
+
+
+# ── UMASS LOWELL — Online & Professional Studies (gps.uml.edu) ──────────────
+
+UML_GPS_TERMS = [
+    "2026/fall",
+    "2026/summer",
+    # add more term slugs as needed, e.g. "2026/spring"
+]
+
+
+def scrape_uml_gps() -> list[dict]:
+    """
+    UMass Lowell, Division of Graduate, Online & Professional Studies
+    (gps.uml.edu). This is the continuing-ed / online catalog (it also
+    includes some on-campus evening sections), NOT the full day-school
+    undergraduate catalog — see scrape_uml_catalog() for that (stub).
+
+    /catalog/search/{year}/{term}/ lists all sections.  We dedupe by course
+    code (e.g. "acct.2010") so each course is only fetched once across all
+    sections and terms.  Each detail page has an h2 structure:
+      h2 "Course Description" → p (description)
+      h2 "Prerequisites, Notes & Instructor" → ul > li items
+    """
+    BASE = "https://gps.uml.edu"
+    seen_courses: dict = {}  # course_code -> first section detail URL
+
+    for term_slug in UML_GPS_TERMS:
+        list_url = f"{BASE}/catalog/search/{term_slug}/"
+        print(f"  [UML GPS] loading {term_slug} …")
+        try:
+            r = get(list_url)
+            s = make_soup(r)
+        except Exception as e:
+            print(f"  [UML GPS] {term_slug} failed: {e}")
+            continue
+
+        for a in s.select("a[href*='/catalog/search/']"):
+            href = str(a["href"])
+            m = re.search(
+                r"/catalog/search/\d{4}/[a-z]+/([a-z]+\.\d{3,4}[a-z]?)/[a-z0-9]+/?$",
+                href, re.I,
+            )
+            if not m:
+                continue
+            course_id = m.group(1).lower()
+            if course_id not in seen_courses:
+                seen_courses[course_id] = href if href.startswith("http") else BASE + href
+
+        print(f"  [UML GPS] {term_slug}: {len(seen_courses)} unique courses so far")
+
+    detail_list = list(seen_courses.values())
+    print(f"  [UML GPS] {len(detail_list)} unique courses, fetching details …")
+
+    courses = []
+    for i, detail_url in enumerate(detail_list, 1):
+        try:
+            rd = get(detail_url)
+            sd = make_soup(rd)
+        except Exception as e:
+            print(f"    [{i}/{len(detail_list)}] error: {e}")
+            continue
+
+        h1 = sd.find("h1")
+        title = h1.get_text(" ", strip=True) if h1 else ""
+
+        full_text = sd.get_text("\n", strip=True)
+
+        # "Course No: ACCT.2010-001" → "ACCT.2010"
+        code = ""
+        m = re.search(r"Course No:\s*([A-Z]{2,8}\.\d{3,4}[A-Z]?)-", full_text, re.I)
+        if m:
+            code = m.group(1).upper()
+
+        # Description: <p> directly after the "Course Description" h2
+        desc = ""
+        desc_h2 = next(
+            (h for h in sd.find_all("h2") if re.search(r"Course Description", h.get_text(), re.I)),
+            None,
+        )
+        if desc_h2:
+            p = desc_h2.find_next_sibling("p")
+            if p:
+                desc = p.get_text(" ", strip=True)
+
+        # Credits and prereqs: <li> items in the ul after "Prerequisites, Notes & Instructor"
+        credits = ""
+        prereqs = ""
+        prereq_h2 = next(
+            (h for h in sd.find_all("h2") if re.search(r"Prerequisites", h.get_text(), re.I)),
+            None,
+        )
+        if prereq_h2:
+            ul = prereq_h2.find_next_sibling("ul")
+            if ul:
+                for li in ul.find_all("li"):
+                    li_text = li.get_text(" ", strip=True)
+                    if li_text.lower().startswith("credits:"):
+                        mc = re.search(r"Credits:\s*(\S+)", li_text, re.I)
+                        if mc:
+                            credits = mc.group(1).rstrip(";")
+                    elif li_text.lower().startswith("prerequisite"):
+                        prereqs = re.sub(r"^Prerequisites?:\s*", "", li_text, flags=re.I).strip()
+
+        if i % 50 == 0:
+            print(f"    {i}/{len(detail_list)} done …")
+
+        courses.append({
+            "College":       "University of Massachusetts Lowell (GPS)",
+            "Code":          code,
+            "Title":         title,
+            "Credits":       credits,
+            "Description":   desc,
+            "Prerequisites": prereqs,
+        })
+
+    print(f"  [UML GPS] total unique courses: {len(courses)}")
+    return courses
+
+
+# ── UMASS AMHERST — University+ (universityplus.umass.edu) ───────────────────
+
+UMA_TERM_TID = "1144"  # Drupal internal TID for Fall 2026 (SPIRE code 1267)
+
+
+def scrape_uma() -> list[dict]:
+    """
+    UMass Amherst University+ continuing-education catalog.
+    Data comes from the Drupal REST API backing the React explore page at
+    https://www.umass.edu/universityplus/classes/explore
+
+    The API returns one JSON object per unique course (already deduplicated by
+    course_id). Prerequisites are embedded in the description field as
+    "Prerequisite: ..." prose; credits are not exposed by the API.
+    """
+    API = "https://www.umass.edu/universityplus/api/courses"
+
+    print("  [UMA] fetching course list from University+ API …")
+    courses: list[dict] = []
+    page = 0
+    total_pages: int | None = None
+
+    while True:
+        try:
+            r = get(API, params={
+                "spire_term":     UMA_TERM_TID,
+                "items_per_page": "50",
+                "page":           str(page),
+            })
+            data = r.json()
+        except Exception as e:
+            print(f"  [UMA] page {page} failed: {e}")
+            break
+
+        rows = data.get("rows", [])
+        pager = data.get("pager", {})
+
+        if total_pages is None:
+            total_pages = int(pager.get("total_pages", 1))
+            print(f"  [UMA] {pager.get('total_items', '?')} courses, {total_pages} pages …")
+
+        for row in rows:
+            title = html.unescape(row.get("title", ""))
+            raw_desc = html.unescape(row.get("description", ""))
+            subject = row.get("subject_raw", "")
+            catalog = row.get("catalog", "")
+            code = f"{subject} {catalog}".strip()
+
+            prereqs = ""
+            m = re.search(r"Prerequisite[s]?:\s*(.+)", raw_desc, re.I | re.S)
+            if m:
+                prereqs = m.group(1).strip()
+
+            courses.append({
+                "College":       "University of Massachusetts Amherst",
+                "Code":          code,
+                "Title":         title,
+                "Credits":       "",
+                "Description":   raw_desc,
+                "Prerequisites": prereqs,
+            })
+
+        print(f"  [UMA] page {page + 1}/{total_pages} ({len(rows)} courses)")
+        page += 1
+        if page >= (total_pages or 1):
+            break
+
+    print(f"  [UMA] total courses: {len(courses)}")
+    return courses
 
 
 # ── REGISTRY ──────────────────────────────────────────────────────────────────
@@ -556,15 +1257,18 @@ ALL_SCRAPERS: dict[str, tuple[str, callable]] = {
     "hcc":        ("Holyoke Community College",              scrape_hcc),
     "stcc":       ("Springfield Technical CC",               scrape_stcc),
     "bristol":    ("Bristol Community College",              scrape_bristol),
-    "gcc":        ("Greenfield Community College",           scrape_gcc),
+    #"gcc":        ("Greenfield Community College",           scrape_gcc),
     "rcc":        ("Roxbury Community College",              scrape_rcc),
-    "berkshire":  ("Berkshire Community College",            scrape_berkshire),
+    #"berkshire":  ("Berkshire Community College",            scrape_berkshire),
     "capecod":    ("Cape Cod Community College",             scrape_capecod),
     "massasoit":  ("Massasoit Community College",            scrape_massasoit),
     "mwcc":       ("Mount Wachusett Community College",      scrape_mwcc),
     "northshore": ("North Shore Community College",          scrape_northshore),
-    "necc":       ("Northern Essex Community College",       scrape_necc),
     "qcc":        ("Quinsigamond Community College",         scrape_qcc),
+    "necc":       ("Northern Essex Community College",         scrape_necc),
+    "umb":        ("University of Massachusetts Boston",     scrape_umb),
+    "uml_gps":    ("University of Massachusetts Lowell (GPS)", scrape_uml_gps),
+    "uma":        ("University of Massachusetts Amherst",   scrape_uma),
 }
 
 
@@ -635,6 +1339,8 @@ def write_xlsx(all_courses: list[dict], path: str) -> None:
     wb.save(path)
     print(f"\n✓  Saved {len(all_courses)} courses → {path}")
 
+    
+
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
@@ -646,61 +1352,29 @@ def main() -> None:
         help="Scrape only one college (omit to scrape all)",
     )
     parser.add_argument(
-        "--colleges",
-        nargs="+",
-        choices=list(ALL_SCRAPERS.keys()),
-        metavar="KEY",
-        help="Scrape multiple colleges, e.g. --colleges bhcc middlesex",
-    )
-    parser.add_argument(
         "--output", default=OUTPUT_FILE,
         help=f"Output .xlsx path (default: {OUTPUT_FILE})",
     )
-    parser.add_argument(
-        "--parallel", action="store_true",
-        help="Scrape colleges in parallel (faster for multiple colleges)",
-    )
     args = parser.parse_args()
 
-    if args.colleges:
-        targets = {k: ALL_SCRAPERS[k] for k in args.colleges}
-    elif args.college:
-        targets = {args.college: ALL_SCRAPERS[args.college]}
-    else:
-        targets = ALL_SCRAPERS
+    targets = (
+        {args.college: ALL_SCRAPERS[args.college]}
+        if args.college
+        else ALL_SCRAPERS
+    )
 
     all_courses: list[dict] = []
 
-    if args.parallel and len(targets) > 1:
-        print(f"Running {len(targets)} colleges in parallel…\n")
-        results: dict[str, list[dict]] = {}
-        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
-            future_to_name = {
-                executor.submit(fn): name
-                for (name, fn) in targets.values()
-            }
-            for future in as_completed(future_to_name):
-                college_name = future_to_name[future]
-                try:
-                    courses = future.result()
-                    results[college_name] = courses
-                    print(f"  ✓  {college_name}: {len(courses)} courses collected")
-                except Exception as e:
-                    print(f"  ✗  {college_name}: scraper failed: {e}")
-                    results[college_name] = []
-        for name, _ in targets.values():
-            all_courses.extend(results.get(name, []))
-    else:
-        for (name, fn) in targets.values():
-            print(f"\n{'─' * 60}")
-            print(f"Scraping: {name}")
-            print(f"{'─' * 60}")
-            try:
-                courses = fn()
-                print(f"  ✓  {len(courses)} courses collected")
-                all_courses.extend(courses)
-            except Exception as e:
-                print(f"  ✗  Scraper failed: {e}")
+    for _, (name, fn) in targets.items():
+        print(f"\n{'─' * 60}")
+        print(f"Scraping: {name}")
+        print(f"{'─' * 60}")
+        try:
+            courses = fn()
+            print(f"  ✓  {len(courses)} courses collected")
+            all_courses.extend(courses)
+        except Exception as e:
+            print(f"  ✗  Scraper failed: {e}")
 
     if not all_courses:
         print("\nNo courses collected — nothing to write.")
