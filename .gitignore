@@ -6,9 +6,30 @@ __pycache__/
 venv/
 env/
 
+# Secrets
+.env
+.streamlit/secrets.toml
+
 # Output files — don't commit scraped data
 transfer_courses*.xlsx
 *.csv
+scrape_history.json
+
+# Logs
+*.log
+*_log.txt
+
+# Office lock files
+~$*
+
+# Old/experimental scripts and eval data — not part of the app
+Archived/
+Evaluation/
+sanity check
+sanity check 2.py
+
+# Personal notes — not meant for a public repo
+*.docx
 
 # IDE
 .vscode/

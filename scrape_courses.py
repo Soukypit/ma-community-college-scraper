@@ -42,6 +42,12 @@ Colleges implemented
 
 Setup:
     pip install -r requirements.txt
+    playwright install chromium   # one-time browser download, needed for
+                                   # the Acalog/Modern Campus WAF challenge
+
+    Optional: copy .env.example to .env and fill in NOTION_TOKEN to mirror
+    scrape_history.json into a Notion "Scraper Health Tracker" database
+    after every run. Skip this file entirely to run without Notion.
 
 Run all colleges:
     python scrape_courses.py
@@ -54,6 +60,7 @@ import argparse
 import csv
 import html
 import io
+import json
 import os
 import re
 import string
@@ -70,6 +77,26 @@ from openpyxl.styles import Alignment, Font, PatternFill
 REQUEST_DELAY = 0.5   # seconds between HTTP requests
 OUTPUT_FILE   = "transfer_courses.xlsx"
 
+HISTORY_FILE       = "scrape_history.json"
+REGRESSION_DROP_PCT = 0.15   # warn if a college's count falls >15% below its last good run
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Minimal .env loader (KEY=VALUE per line) so secrets like NOTION_TOKEN
+    don't need to be hardcoded or exported as real shell environment vars."""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; TransferResearchBot/1.0; "
@@ -77,14 +104,73 @@ HEADERS = {
     )
 }
 
+# Modern Campus/Acalog catalog hosts sit behind an AWS WAF JS challenge that
+# blocks plain HTTP clients outright (empty 202 response). A real browser UA
+# is required for the headless-browser challenge solve in _get_waf_session().
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    )
+}
+
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
-def get(url: str, verify: bool = True, **kwargs) -> requests.Response:
-    """Rate-limited GET with shared headers. Raises on HTTP error."""
-    r = requests.get(url, headers=HEADERS, timeout=30, verify=verify, **kwargs)
+def get(url: str, verify: bool = True, session: "requests.Session | None" = None, **kwargs) -> requests.Response:
+    """Rate-limited GET. Uses `session` (with its own cookies/headers) if given,
+    otherwise a plain request with the shared bot headers. Raises on HTTP error."""
+    if session is not None:
+        r = session.get(url, timeout=30, verify=verify, **kwargs)
+    else:
+        r = requests.get(url, headers=HEADERS, timeout=30, verify=verify, **kwargs)
     r.raise_for_status()
     time.sleep(REQUEST_DELAY)
     return r
+
+
+_waf_sessions: dict[str, requests.Session] = {}
+
+
+def _get_waf_session(url: str, verify_ssl: bool = True, force_refresh: bool = False) -> requests.Session:
+    """
+    Solve a host's AWS WAF JS challenge once via headless Chromium, then reuse
+    the resulting cookies (aws-waf-token, ALB stickiness, etc.) in a plain
+    requests.Session for the rest of that host's crawl — much faster than
+    driving every page through the browser. Cached per host.
+
+    The token appears to expire after a few hundred requests; when that
+    happens the site doesn't error, it silently re-serves an earlier page.
+    Pass force_refresh=True to re-solve and replace the cached session.
+    """
+    host = _host(url)
+    if not force_refresh and host in _waf_sessions:
+        return _waf_sessions[host]
+
+    from playwright.sync_api import sync_playwright
+
+    print(f"    (solving WAF challenge for {host} …)")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=BROWSER_HEADERS["User-Agent"],
+            ignore_https_errors=not verify_ssl,
+        )
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        cookies = page.context.cookies()
+        browser.close()
+
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+    for c in cookies:
+        name = c.get("name")
+        if name is None:
+            continue
+        session.cookies.set(
+            name, c.get("value", ""), domain=c.get("domain", ""), path=c.get("path", "/"),
+        )
+
+    _waf_sessions[host] = session
+    return session
 
 
 def make_soup(r: requests.Response) -> BeautifulSoup:
@@ -125,126 +211,118 @@ def _scrape_acalog(
     """
     Generic scraper for all Acalog / Modern Campus Catalog sites.
 
-    Strategy
-    --------
-    1. Load the courses page once to collect every subject prefix from the
-       filter <select> dropdown.
-    2. Fetch one filtered URL per prefix — each returns only that prefix's
-       course links, keeping individual requests small and fast.
-    3. Follow each preview_course_nopop.php detail link and parse.
+    NOTE: filter[prefix]=X no longer restricts results on these sites — every
+    prefix value (confirmed live, including in a real rendered browser) returns
+    the same default listing. So instead of looping per-prefix, we just paginate
+    the unfiltered course listing via filter[cpage]=1,2,3... until a page yields
+    no new links, which reliably walks the entire catalog in one pass.
     """
     host     = _host(base_catalog_url)
     base_url = f"https://{host}/content.php?catoid={catoid}&navoid={navoid}"
 
-    print(f"  [{college_name}] loading index …")
     try:
-        r = get(base_url, verify=verify_ssl)
-        s = make_soup(r)
+        session = _get_waf_session(base_url, verify_ssl=verify_ssl)
     except Exception as e:
-        print(f"  [{college_name}] index failed: {e}")
+        print(f"  [{college_name}] WAF challenge failed: {e}")
         return []
 
-    # Collect subject prefixes from the filter dropdown
-    prefix_select = s.find("select", attrs={"name": re.compile(r"prefix", re.I)})
-    if prefix_select:
-        prefixes = [
-            o["value"].strip()
-            for o in prefix_select.find_all("option")
-            if o.get("value", "").strip() not in ("", "0")
-        ]
-    else:
-        seen = set()
-        prefixes = []
-        for a in s.select("a[href*='preview_course_nopop.php']"):
-            m = re.search(r"([A-Z]{2,5})[-\s]\d", a.get_text())
-            if m and m.group(1) not in seen:
-                seen.add(m.group(1))
-                prefixes.append(m.group(1))
-
-    if not prefixes:
-        print(f"  [{college_name}] no prefixes found — fetching whole page")
-        prefixes = [""]
-
-    label = ", ".join(prefixes[:6]) + ("…" if len(prefixes) > 6 else "")
-    print(f"  [{college_name}] {len(prefixes)} prefix(es): {label}")
+    base_params = "&filter[item_type]=3&filter[only_active]=1&filter[3]=1"
 
     courses    = []
     seen_coids = set()
+    page = 1
+    while True:
+        # The WAF token seems to expire after a few hundred requests; refresh
+        # proactively every few pages so it doesn't go stale mid-crawl.
+        if page > 1 and (page - 1) % 4 == 0:
+            session = _get_waf_session(base_url, verify_ssl=verify_ssl, force_refresh=True)
 
-    for prefix in prefixes:
-        base_params = "&filter[item_type]=3&filter[only_active]=1&filter[3]=1"
-        if prefix:
-            base_params += f"&filter[prefix]={prefix}"
+        page_param = f"&filter[cpage]={page}" if page > 1 else ""
+        list_url   = base_url + base_params + page_param
 
-        # Paginate: Acalog shows up to 100 results per page by default.
-        # Keep fetching filter[cpage]=1,2,3... until a page yields no new links.
-        page = 1
-        while True:
-            page_param = f"&filter[cpage]={page}" if page > 1 else ""
-            list_url   = base_url + base_params + page_param
+        try:
+            r = get(list_url, verify=verify_ssl, session=session)
+            s = make_soup(r)
+        except Exception as e:
+            print(f"  [{college_name}] page {page}: {e}")
+            break
 
-            try:
-                r = get(list_url, verify=verify_ssl)
-                s = make_soup(r)
-            except Exception as e:
-                print(f"    prefix {prefix!r} page {page}: {e}")
-                break
-
-            links = (
-                s.select("a[href*='preview_course_nopop.php']") or
-                s.select("a[href*='preview_course.php']")
+        def _extract_new_links(soup: BeautifulSoup) -> list:
+            found = (
+                soup.select("a[href*='preview_course_nopop.php']") or
+                soup.select("a[href*='preview_course.php']")
             )
-
-            new_links = []
-            for a in links:
-                m    = re.search(r"coid=(\d+)", a["href"])
-                coid = m.group(1) if m else a["href"]
+            out = []
+            for a in found:
+                href = str(a["href"])
+                m    = re.search(r"coid=(\d+)", href)
+                coid = m.group(1) if m else href
                 if coid not in seen_coids:
                     seen_coids.add(coid)
-                    new_links.append(a)
+                    out.append(a)
+            return out
 
-            print(f"    {prefix or '(all)'} p{page}: {len(new_links)} new courses")
+        new_links = _extract_new_links(s)
 
-            for i, a in enumerate(new_links, 1):
-                href       = a["href"]
-                raw_title  = a.get_text(strip=True)
-                detail_url = (
-                    href if href.startswith("http")
-                    else f"https://{host}/{href.lstrip('/')}"
-                )
+        if not new_links:
+            # Could be genuine end-of-catalog, or a stale/expired WAF token
+            # silently re-serving an earlier page — that looks identical to
+            # "no new courses". Refresh and retry once before trusting it.
+            print(f"  [{college_name}] p{page}: 0 new — refreshing WAF session to confirm end of catalog …")
+            session = _get_waf_session(base_url, verify_ssl=verify_ssl, force_refresh=True)
+            try:
+                r = get(list_url, verify=verify_ssl, session=session)
+                new_links = _extract_new_links(make_soup(r))
+            except Exception as e:
+                print(f"  [{college_name}] refresh retry failed: {e}")
 
-                print(f"      [{i}/{len(new_links)}] {raw_title[:60]}", flush=True)
+        print(f"  [{college_name}] p{page}: {len(new_links)} new courses ({len(seen_coids)} total)")
 
-                try:
-                    rd = get(detail_url, verify=verify_ssl)
-                    code, credits, desc, prereqs = _parse_acalog_detail(make_soup(rd))
-                except Exception as e:
-                    print(f"      ✗ detail error: {e}")
-                    code = credits = desc = prereqs = ""
+        for i, a in enumerate(new_links, 1):
+            href       = a["href"]
+            raw_title  = a.get_text(strip=True)
+            detail_url = (
+                href if href.startswith("http")
+                else f"https://{host}/{href.lstrip('/')}"
+            )
 
-                courses.append({
-                    "College":       college_name,
-                    "Code":          code or _extract_code(raw_title),
-                    "Title":         raw_title,
-                    "Credits":       credits,
-                    "Description":   desc,
-                    "Prerequisites": prereqs,
-                })
+            print(f"    [{i}/{len(new_links)}] {raw_title[:60]}", flush=True)
 
-            # Stop if this page had no new links (we've exhausted this prefix)
-            if not new_links:
-                break
-            page += 1
+            try:
+                rd = get(detail_url, verify=verify_ssl, session=session)
+                code, credits, desc, prereqs = _parse_acalog_detail(make_soup(rd))
+            except Exception as e:
+                print(f"    ✗ detail error: {e}")
+                code = credits = desc = prereqs = ""
 
+            courses.append({
+                "College":       college_name,
+                "Code":          code or _extract_code(raw_title),
+                "Title":         raw_title,
+                "Credits":       credits,
+                "Description":   desc,
+                "Prerequisites": prereqs,
+            })
+
+        # Stop once a page yields no new links (catalog exhausted)
+        if not new_links:
+            break
+        page += 1
+
+    print(f"  [{college_name}] total courses: {len(courses)}")
     return courses
 
 
 def _parse_acalog_detail(s: BeautifulSoup) -> tuple:
-    h1  = s.find("h1") or s.find("h2")
+    # Acalog pages have multiple <h1>s (site name, then the course title) —
+    # pick the one that actually looks like a course code.
+    h1 = next(
+        (h for h in s.find_all(["h1", "h2"]) if _extract_code(h.get_text(" ", strip=True))),
+        None,
+    )
     raw = h1.get_text(" ", strip=True) if h1 else ""
 
-    code    = _extract_code(raw)
-    credits = _extract_credits(raw) or _extract_credits(s.get_text(" "))
+    code = _extract_code(raw)
 
     desc_el = (
         s.select_one("td.block_content_popup") or
@@ -252,6 +330,12 @@ def _parse_acalog_detail(s: BeautifulSoup) -> tuple:
         s.select_one("td.block_content")
     )
     desc = desc_el.get_text(" ", strip=True) if desc_el else ""
+
+    # Acalog renders credits label-first ("Credits: 3" / "Credits 3 Lecture …"),
+    # not "3 Credits" — match that first before falling back to the generic
+    # number-before-label heuristic used by other catalog platforms.
+    m_credits = re.search(r"Credits?:?\s*(\d+(?:\.\d+)?)\b", desc, re.I)
+    credits = m_credits.group(1) if m_credits else (_extract_credits(raw) or _extract_credits(desc))
 
     m       = re.search(r"Prerequisite[s]?[:\s]+(.+?)(?:\n|Corequisite|$)", desc, re.I | re.DOTALL)
     prereqs = m.group(1).strip() if m else ""
@@ -298,59 +382,121 @@ def scrape_stcc() -> list[dict]:
     )
 
 
-# ── CLEAN CATALOG (Bristol CC) ────────────────────────────────────────────────
+# ── COURSEDOG (Bristol CC) ───────────────────────────────────────────────────
 
 def scrape_bristol() -> list[dict]:
     """
-    Bristol CC uses Clean Catalog (cleancatalog.net).
-    Courses are listed alphabetically at /classes/{letter}.
-    Each course has its own page at /{subject}/{course-code}.
+    Bristol CC migrated its catalog platform from Clean Catalog to CourseDog
+    (coursedog.com) — the old /classes/{letter} pages 404 now, and course
+    data is loaded client-side from a JSON search API instead of server-
+    rendered HTML. This replicates that API call directly, so the whole
+    catalog comes back in one or two requests instead of one page per
+    course. catalogId/school-id/filter body captured from the live SPA's
+    network traffic (https://catalog.bristolcc.edu/courses).
+
+    Note: the API 401s without an explicit Origin header — browsers send it
+    automatically for cross-site fetches, but requests does not.
     """
-    BASE    = "https://catalog.bristolcc.edu"
-    courses = []
-    seen    = set()
+    API = "https://app.coursedog.com/api/v1/cm/bristolcc_banner/courses/search/%24filters"
+    CD_HEADERS = {
+        **BROWSER_HEADERS,
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+        "Referer":      "https://catalog.bristolcc.edu/",
+        "Origin":       "https://catalog.bristolcc.edu",
+        "x-requested-with": "catalog",
+    }
+    FILTER_BODY = {
+        "condition": "AND",
+        "filters": [{
+            "condition": "and",
+            "id": "lVmUFvOl",
+            "filters": [
+                {"id": "departments-course", "condition": "field", "name": "departments",
+                 "inputType": "select", "group": "course", "type": "isNotEmpty"},
+                {"id": "status-course", "condition": "field", "name": "status",
+                 "inputType": "select", "group": "course", "type": "is",
+                 "value": "Active", "customField": False},
+                {"id": "description-course", "condition": "field", "name": "description",
+                 "inputType": "text", "group": "course", "type": "isNotEmpty", "customField": False},
+                {"id": "departments-course", "condition": "field", "name": "departments",
+                 "inputType": "select", "group": "course", "type": "isNot", "value": ["NONC"]},
+                {"id": "departments-course", "condition": "field", "name": "departments",
+                 "inputType": "select", "group": "course", "type": "isNot", "value": ["ADED"]},
+            ],
+        }],
+    }
 
-    for letter in string.ascii_lowercase:
-        page = 0
-        while True:
-            url = f"{BASE}/classes/{letter}" + (f"?page={page}" if page else "")
-            try:
-                r = get(url)
-                s = make_soup(r)
-            except Exception as e:
-                print(f"  [Bristol] /{letter} page {page}: {e}")
-                break
+    courses    = []
+    seen_codes = set()
+    skip  = 0
+    limit = 300
+    total = None
 
-            new_on_page = 0
-            # Course links look like /accounting/acc-101 (two path segments)
-            for a in s.select("a[href]"):
-                href = str(a["href"])
-                if (
-                    re.match(r"^/[a-z][a-z0-9-]+/[a-z]{2,5}-\d{3,4}", href)
-                    and href not in seen
-                ):
-                    seen.add(href)
-                    new_on_page += 1
-                    detail_url = BASE + href
-                    try:
-                        rd = get(detail_url)
-                        c  = _parse_cleancatalog_detail(make_soup(rd))
-                        c["College"] = "Bristol Community College"
-                        courses.append(c)
-                    except Exception as e:
-                        print(f"  [Bristol] detail error {href}: {e}")
+    print("  [Bristol] fetching CourseDog course search API …")
+    while total is None or skip < total:
+        params = {
+            "catalogId": "rNbZiyg17Ifkj0v0AUE8",
+            "skip": skip,
+            "limit": limit,
+            "orderBy": "code",
+            "formatDependents": "false",
+            "ignoreEffectiveDating": "false",
+            "ignoreTotalCount": "false",
+            "columns": "name,longName,courseNumber,subjectCode,code,description,credits,status",
+        }
+        try:
+            r = requests.post(API, params=params, json=FILTER_BODY, headers=CD_HEADERS, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"  [Bristol] skip={skip}: {e}")
+            break
+        time.sleep(REQUEST_DELAY)
 
-            # Stop paging when no new courses appear or no "Load More" link
-            has_more = any(
-                "page=" in str(a.get("href", "")) for a in s.select("a[href]")
-                if "load" in a.get_text(strip=True).lower() or "more" in a.get_text(strip=True).lower()
-            )
-            if not new_on_page or not has_more:
-                break
-            page += 1
+        total = data.get("listLength", 0)
+        rows  = data.get("data", [])
+        if not rows:
+            break
 
-        print(f"  [Bristol] /classes/{letter}: {len(seen)} courses total")
+        new_this_page = 0
+        for item in rows:
+            code = item.get("code", "")
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            new_this_page += 1
 
+            subject, number = item.get("subjectCode", ""), item.get("courseNumber", "")
+            display_code = f"{subject} {number}".strip() or code
+            title = item.get("longName") or item.get("name", "")
+            desc  = item.get("description", "")
+
+            credit_hours = ((item.get("credits") or {}).get("creditHours") or {})
+            cmin, cmax = credit_hours.get("min"), credit_hours.get("max")
+            if cmin is None:
+                credits = ""
+            elif cmax is None or cmax == cmin:
+                credits = str(cmin)
+            else:
+                credits = f"{cmin}-{cmax}"
+
+            m = re.search(r"Pre-?requisite[s]?:?\s*(.+?)(?:\.\s|\.$|$)", desc, re.I)
+            prereqs = m.group(1).strip() if m else ""
+
+            courses.append({
+                "College":       "Bristol Community College",
+                "Code":          display_code,
+                "Title":         title,
+                "Credits":       credits,
+                "Description":   desc,
+                "Prerequisites": prereqs,
+            })
+
+        print(f"  [Bristol] skip={skip}: {new_this_page} new courses ({len(seen_codes)} total of {total})")
+        skip += limit
+
+    print(f"  [Bristol] total courses: {len(courses)}")
     return courses
 
 
@@ -1247,6 +1393,20 @@ def scrape_uma() -> list[dict]:
     print(f"  [UMA] total courses: {len(courses)}")
     return courses
 
+def scrape_umd() -> list[dict]:
+    """
+    UMass Dartmouth (catalog.umassd.edu) — same Acalog / Modern Campus
+    Catalog platform as BHCC, Middlesex, MassBay, HCC, and STCC, so this
+    just delegates to the shared _scrape_acalog() helper.
+
+    catoid=86 & navoid=6824 come from the "Course Descriptions" link at
+    https://catalog.umassd.edu/content.php?catoid=86&navoid=6824
+    """
+    return _scrape_acalog(
+        "University of Massachusetts Dartmouth",
+        "https://catalog.umassd.edu/", "86", "6824",
+    )
+
 
 # ── REGISTRY ──────────────────────────────────────────────────────────────────
 
@@ -1269,6 +1429,7 @@ ALL_SCRAPERS: dict[str, tuple[str, callable]] = {
     "umb":        ("University of Massachusetts Boston",     scrape_umb),
     "uml_gps":    ("University of Massachusetts Lowell (GPS)", scrape_uml_gps),
     "uma":        ("University of Massachusetts Amherst",   scrape_uma),
+    "umd":        ("University of Massachusetts Dartmouth",   scrape_umd),
 }
 
 
@@ -1339,7 +1500,131 @@ def write_xlsx(all_courses: list[dict], path: str) -> None:
     wb.save(path)
     print(f"\n✓  Saved {len(all_courses)} courses → {path}")
 
-    
+
+# ── REGRESSION TRACKING ───────────────────────────────────────────────────────
+# Catalog sites change out from under us (WAF rollouts, platform migrations,
+# dead URLs) with no error of their own — a scraper can "succeed" with 0 or a
+# suspiciously low count and look identical to a normal run in the console.
+# This compares each run against the last known-good count per college and
+# raises a loud warning when something looks broken, instead of relying on
+# someone noticing a number looked off while scrolling the log.
+
+def _load_history() -> dict:
+    if not os.path.exists(HISTORY_FILE):
+        return {}
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_history(history: dict) -> None:
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, sort_keys=True)
+
+
+def _check_regression(key: str, name: str, count: int, history: dict) -> "str | None":
+    """Update history[key] in place; return a warning string if this run looks broken."""
+    entry     = history.setdefault(key, {})
+    prev_good = entry.get("last_good_count")
+    now       = datetime.now().isoformat(timespec="seconds")
+
+    warning = None
+    if count == 0:
+        warning = f"{name}: 0 courses collected" + (
+            f" (last good run had {prev_good}, on {entry.get('last_good_at', '?')})" if prev_good else ""
+        )
+    elif prev_good and count < prev_good * (1 - REGRESSION_DROP_PCT):
+        pct = 100 * (1 - count / prev_good)
+        warning = f"{name}: {count} courses, down {pct:.0f}% from last good run of {prev_good} (on {entry.get('last_good_at', '?')})"
+
+    entry["last_run_count"] = count
+    entry["last_run_at"]    = now
+    # Only refresh the "good" baseline on a run that isn't itself flagged —
+    # otherwise a broken run's low count becomes tomorrow's baseline and the
+    # next broken run looks like a non-event.
+    if count > 0 and warning is None:
+        entry["last_good_count"] = count
+        entry["last_good_at"]    = now
+
+    return warning
+
+
+# ── NOTION SYNC (optional) ────────────────────────────────────────────────────
+# Mirrors scrape_history.json into a Notion database so the tracker is visible
+# without opening the JSON file. Fully opt-in: no-ops silently unless both
+# NOTION_TOKEN and NOTION_DATABASE_ID are set (e.g. via a local .env file —
+# see .env.example). Get a token at https://www.notion.so/my-integrations and
+# share the "Scraper Health Tracker" database with it.
+
+NOTION_API     = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+
+
+def _notion_headers() -> "dict | None":
+    token = os.environ.get("NOTION_TOKEN")
+    if not token:
+        return None
+    return {
+        "Authorization":  f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type":   "application/json",
+    }
+
+
+def _push_history_to_notion(history: dict, warning_keys: set) -> None:
+    headers = _notion_headers()
+    db_id   = os.environ.get("NOTION_DATABASE_ID")
+    if not headers or not db_id:
+        return
+
+    print("\nSyncing scrape_history.json to Notion …")
+    for key, entry in history.items():
+        name   = ALL_SCRAPERS[key][0] if key in ALL_SCRAPERS else key
+        status = "WARNING" if key in warning_keys else "OK"
+
+        properties = {
+            "College":         {"title": [{"text": {"content": name}}]},
+            "Key":             {"rich_text": [{"text": {"content": key}}]},
+            "Status":          {"select": {"name": status}},
+            "Last Run Count":  {"number": entry.get("last_run_count")},
+            "Last Good Count": {"number": entry.get("last_good_count")},
+        }
+        if entry.get("last_run_at"):
+            properties["Last Run At"] = {"date": {"start": entry["last_run_at"]}}
+        if entry.get("last_good_at"):
+            properties["Last Good At"] = {"date": {"start": entry["last_good_at"]}}
+
+        try:
+            q = requests.post(
+                f"{NOTION_API}/databases/{db_id}/query",
+                headers=headers,
+                json={"filter": {"property": "Key", "rich_text": {"equals": key}}},
+                timeout=15,
+            )
+            q.raise_for_status()
+            existing = q.json().get("results", [])
+
+            if existing:
+                page_id = existing[0]["id"]
+                r = requests.patch(
+                    f"{NOTION_API}/pages/{page_id}",
+                    headers=headers, json={"properties": properties}, timeout=15,
+                )
+            else:
+                r = requests.post(
+                    f"{NOTION_API}/pages",
+                    headers=headers,
+                    json={"parent": {"database_id": db_id}, "properties": properties},
+                    timeout=15,
+                )
+            r.raise_for_status()
+        except Exception as e:
+            print(f"  [Notion sync] {key}: {e}")
+            continue
+
+    print("✓  Notion sync done")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -1352,29 +1637,87 @@ def main() -> None:
         help="Scrape only one college (omit to scrape all)",
     )
     parser.add_argument(
+        "--colleges",
+        nargs="+",
+        choices=list(ALL_SCRAPERS.keys()),
+        metavar="KEY",
+        help="Scrape multiple colleges, e.g. --colleges bhcc middlesex",
+    )
+    parser.add_argument(
         "--output", default=OUTPUT_FILE,
         help=f"Output .xlsx path (default: {OUTPUT_FILE})",
     )
+    parser.add_argument(
+        "--parallel", action="store_true",
+        help="Scrape colleges concurrently in threads (faster for multiple colleges; "
+             "output from different colleges will interleave in the console)",
+    )
     args = parser.parse_args()
 
-    targets = (
-        {args.college: ALL_SCRAPERS[args.college]}
-        if args.college
-        else ALL_SCRAPERS
-    )
+    if args.colleges:
+        targets = {k: ALL_SCRAPERS[k] for k in args.colleges}
+    elif args.college:
+        targets = {args.college: ALL_SCRAPERS[args.college]}
+    else:
+        targets = ALL_SCRAPERS
 
     all_courses: list[dict] = []
+    history  = _load_history()
+    warnings: list[str] = []
+    warning_keys: set[str] = set()
 
-    for _, (name, fn) in targets.items():
-        print(f"\n{'─' * 60}")
-        print(f"Scraping: {name}")
-        print(f"{'─' * 60}")
-        try:
-            courses = fn()
-            print(f"  ✓  {len(courses)} courses collected")
-            all_courses.extend(courses)
-        except Exception as e:
-            print(f"  ✗  Scraper failed: {e}")
+    if args.parallel and len(targets) > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print(f"Running {len(targets)} colleges in parallel…\n")
+        results: dict[str, list[dict]] = {}
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            future_to_key = {
+                executor.submit(fn): key
+                for key, (_, fn) in targets.items()
+            }
+            for future in as_completed(future_to_key):
+                key = future_to_key[future]
+                name = targets[key][0]
+                try:
+                    courses = future.result()
+                    results[key] = courses
+                    print(f"  ✓  {name}: {len(courses)} courses collected")
+                except Exception as e:
+                    print(f"  ✗  {name}: scraper failed: {e}")
+                    results[key] = []
+                warning = _check_regression(key, name, len(results[key]), history)
+                if warning:
+                    warnings.append(warning)
+                    warning_keys.add(key)
+        for key in targets:
+            all_courses.extend(results.get(key, []))
+    else:
+        for key, (name, fn) in targets.items():
+            print(f"\n{'─' * 60}")
+            print(f"Scraping: {name}")
+            print(f"{'─' * 60}")
+            try:
+                courses = fn()
+                print(f"  ✓  {len(courses)} courses collected")
+                all_courses.extend(courses)
+            except Exception as e:
+                print(f"  ✗  Scraper failed: {e}")
+                courses = []
+            warning = _check_regression(key, name, len(courses), history)
+            if warning:
+                warnings.append(warning)
+                warning_keys.add(key)
+
+    _save_history(history)
+    _push_history_to_notion(history, warning_keys)
+
+    if warnings:
+        print(f"\n{'!' * 60}")
+        print("⚠  REGRESSION WARNINGS — these colleges may need attention:")
+        for w in warnings:
+            print(f"  ⚠  {w}")
+        print(f"{'!' * 60}")
 
     if not all_courses:
         print("\nNo courses collected — nothing to write.")

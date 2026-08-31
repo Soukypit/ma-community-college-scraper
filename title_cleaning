@@ -1,0 +1,66 @@
+import re
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
+
+BASE       = Path("C:/Users/souke/Articulation document project/ma-college-scraper")
+OUTPUT_DIR = BASE / "Final Version"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Add the files you want to process here — output goes to the "final version" folder
+FILES = [
+    ("transfer_courses_cleaned_mccc.xlsx",          "transfer_courses_title_cleaned_mccc.xlsx"),
+    ("transfer_courses_cleaned_bhcc.xlsx",         "transfer_courses_title_cleaned_bhcc.xlsx"),
+    ("transfer_courses_cleaned_massbay.xlsx",      "transfer_courses_title_cleaned_massbay.xlsx"),
+    ("transfer_courses_cleaned_holyoke.xlsx",     "transfer_courses_title_cleaned_holyoke.xlsx"),
+    ("transfer_courses_20260528_161615(Springfield Technical Community College).xlsx",     "transfer_courses_title_cleaned_springfieldTech.xlsx"),
+    ("transfer_courses_20260601_184955(Roxbury Community College).xlsx",     "transfer_courses_title_cleaned_roxbury.xlsx"),
+    ("transfer_courses_20260603_162234(Bristol Community College).xlsx",     "transfer_courses_title_cleaned_bristol.xlsx"),
+    ("transfer_courses_20260604_124114(CapeCod Comunity College).xlsx",     "transfer_courses_title_cleaned_capecod.xlsx"),
+    ("transfer_courses_20260608_113455 (Massasoit Community College).xlsx",     "transfer_courses_title_cleaned_massasoit.xlsx"),
+    ("transfer_courses_20260608_114840(Mount Wachusett Community College).xlsx",     "transfer_courses_title_cleaned_mwcc.xlsx"),
+    ("transfer_courses_20260609_150746 (North Shore Community College).xlsx",     "transfer_courses_title_cleaned_northshore.xlsx"),
+    ("transfer_courses_20260617_122246 (Northern Essex Community College).xlsx",     "transfer_courses_title_cleaned_northernessex.xlsx"),
+    ("transfer_courses_20260609_152254 (Quinsigamond Community College).xlsx",     "transfer_courses_title_cleaned_quinsigamond.xlsx"),
+    ("transfer_courses_20260701_115310 (University of Massachusetts Boston).xlsx",     "transfer_courses_title_cleaned_umassboston.xlsx"),
+    ("transfer_courses_20260701_133003 (University of Massachusetts Lowell (GPS)).xlsx",     "transfer_courses_title_cleaned_umasslowell.xlsx"),
+    ("transfer_courses_20260701_133003 (University of Massachusetts Lowell (GPS)).xlsx",     "transfer_courses_title_cleaned_umasslowell.xlsx"),
+]
+
+
+CODE_PREFIX = re.compile(r"^[A-Z]{2,4}[-\s]\d+\w*[-\s]+", re.IGNORECASE)
+
+for input_name, output_name in FILES:
+    input_file  = BASE / input_name
+    output_file = OUTPUT_DIR / output_name
+
+    wb = load_workbook(input_file)
+    assert wb.sheetnames, f"{input_name}: workbook has no sheets"
+
+    total_cleaned = 0
+    for ws in wb.worksheets[:2]:
+        header: dict[str, int] = {}
+        for cell in ws[1]:
+            if not isinstance(cell, MergedCell) and cell.value:
+                header[str(cell.value)] = cell.column
+
+        title_col = header.get("Title")
+        if not title_col:
+            print(f"[{input_name}] sheet '{ws.title}': no 'Title' column, skipping")
+            continue
+
+        cleaned = 0
+        for row in ws.iter_rows(min_row=2):
+            cell = row[title_col - 1]
+            if isinstance(cell, MergedCell) or not isinstance(cell.value, str):
+                continue
+            new_val = CODE_PREFIX.sub("", cell.value).strip()
+            if new_val != cell.value:
+                cell.value = new_val
+                cleaned += 1
+
+        total_cleaned += cleaned
+        print(f"[{input_name}] sheet '{ws.title}'  |  titles cleaned: {cleaned}")
+
+    wb.save(output_file)
+    print(f"[{input_name}] -> {output_name}  |  total titles cleaned: {total_cleaned}")
