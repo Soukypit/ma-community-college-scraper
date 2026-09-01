@@ -31,6 +31,12 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 
+from transfer_list_feature import (
+    initialize_session_state,
+    reset_search_tracking,
+    render_sidebar,
+)
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # Resolved relative to this file's location (not the shell's cwd), so it works
 # whether you run `streamlit run streamlit_app.py` from the repo root or
@@ -46,7 +52,7 @@ st.set_page_config(
     page_title="Brandeis Transfer Course Equivalency Simulator",
     page_icon="🔀",
     layout="centered",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ── CUSTOM CSS ──────────────────────────────────────────────────────────────────
@@ -300,6 +306,8 @@ def score_bar_html(score, match_type):
 # ── MAIN APP ───────────────────────────────────────────────────────────────────
 
 def main():
+    initialize_session_state()
+    render_sidebar()
 
     # ── HEADER ────────────────────────────────────────────────────────────────
     st.markdown("""
@@ -388,6 +396,7 @@ def main():
         elif not selected_course_id:
             st.warning("Please select a course.")
         else:
+            reset_search_tracking()  # new search — resets the 2-per-search add cap
             with st.spinner("Searching..."):
                 results = search_equivalencies(selected_course_id)
             st.session_state["search_results"] = results
@@ -443,6 +452,43 @@ def main():
             )
             st.markdown(card_html, unsafe_allow_html=True)
 
+            # ── ADD TO TRANSFER LIST ─────────────────────────────────────────
+            already_in_list = any(
+                item["cc_code"] == r["cc_code"] and item["brd_code"] == r["brd_code"]
+                for item in st.session_state.transfer_list
+            )
+            already_added_this_search = r["brd_code"] in st.session_state.added_this_search
+            limit_reached = len(st.session_state.added_this_search) >= 2
+
+            _, add_col = st.columns([3, 1])
+            with add_col:
+                if already_in_list:
+                    st.markdown(
+                        '<div style="text-align:right;font-size:13px;color:#15803d;padding:6px 0">'
+                        '✅ In your list</div>',
+                        unsafe_allow_html=True,
+                    )
+                elif limit_reached and not already_added_this_search:
+                    st.markdown(
+                        '<div style="text-align:right;font-size:12px;color:#94a3b8;padding:6px 0">'
+                        'Max 2 per search</div>',
+                        unsafe_allow_html=True,
+                    )
+                elif st.button("➕ Add to list", key=f"add_{i}_{r['brd_code']}", use_container_width=True):
+                    st.session_state.transfer_list.append({
+                        "cc_college":       st.session_state["search_college"],
+                        "cc_code":          r["cc_code"],
+                        "cc_title":         r["cc_title"],
+                        "brd_code":         r["brd_code"],
+                        "brd_title":        r["brd_title"],
+                        "match_type":       match_type,
+                        "similarity_score": score,
+                        "brd_department":   r.get("brd_department", ""),
+                        "brd_credits":      r.get("brd_credits"),
+                    })
+                    st.session_state.added_this_search.add(r["brd_code"])
+                    st.rerun()
+
             # Course descriptions — always visible, no need to trigger the
             # AI explanation first.
             with st.expander(f"📄 Course descriptions — {r['cc_code']} → {r['brd_code']}"):
@@ -470,11 +516,18 @@ def main():
                 if explain_key in st.session_state["explanations"]:
                     st.info(st.session_state["explanations"][explain_key])
 
+        if results and len(st.session_state.added_this_search) >= 2:
+            st.info(
+                "✅ You've added 2 courses from this search. "
+                "Search for another course to add more to your list."
+            )
+
     # ── DISCLAIMER ────────────────────────────────────────────────────────────
     st.markdown("""
     <div class="disclaimer">
       <strong>⚠️ Advisory tool only.</strong>
-      These matches are estimates and should be confirmed with a Brandeis
+      These matches are estimates and simulates the potential of each course for transfer credit.
+      The matches should be confirmed with a Brandeis
       academic advisor before making enrollment decisions. Match confidence
       scores are provided to help prioritize advisor review — they do not
       guarantee transfer credit approval.
