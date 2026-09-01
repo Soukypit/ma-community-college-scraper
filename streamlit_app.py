@@ -1,5 +1,5 @@
 """
-Brandeis University — Transfer Course Equivalency Tool
+Brandeis University — Course Equivalency Simulator
 Streamlit App
 
 INSTRUCTIONS:
@@ -39,12 +39,12 @@ DB_PATH = Path(__file__).resolve().parent / "db" / "courses.db"
 
 # Brandeis brand colors
 BRANDEIS_BLUE = "#003478"
-BRANDEIS_GOLD = "#9BA4B7"
+BRANDEIS_GREY = "#9BA4B7"
 
 # ── PAGE CONFIG ─────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Brandeis Transfer Course Lookup",
-    page_icon="🎓",
+    page_title="Brandeis Transfer Course Equivalency Simulator",
+    page_icon="🔀",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -58,7 +58,7 @@ st.markdown(f"""
     color: white;
     padding: 1.25rem 1.5rem;
     border-radius: 10px;
-    border-bottom: 4px solid {BRANDEIS_GOLD};
+    border-bottom: 4px solid {BRANDEIS_GREY};
     margin-bottom: 1.5rem;
     display: flex;
     align-items: center;
@@ -274,9 +274,9 @@ def badge_html(match_type):
 
 def match_description(match_type):
     desc = {
-        "exact":   "✅ High confidence — likely equivalent",
-        "strong":  "🔵 Good match — advisor review recommended",
-        "partial": "⚠️ Possible match — confirm with advisor",
+        "exact":   "✅ High confidence: likely equivalent",
+        "strong":  "🔵 Good match: advisor review recommended",
+        "partial": "⚠️ Possible match: confirm with advisor",
     }
     return desc.get(match_type, "")
 
@@ -310,7 +310,7 @@ def main():
                   flex-shrink:0">B</div>
       <div>
         <h1>Brandeis University</h1>
-        <p>Transfer Course Equivalency Tool</p>
+        <p>Course Equivalency Simulator</p>
       </div>
     </div>
     """, unsafe_allow_html=True)
