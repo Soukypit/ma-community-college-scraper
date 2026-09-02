@@ -33,7 +33,15 @@ the student-facing half of the project:
 3. Click **"Why this match?"** on any result and Claude generates a short,
    plain-language explanation of what the two courses have in common and
    what to confirm with an advisor.
-4. A persistent disclaimer makes clear this is an advisory estimate, not an
+4. **"📖 See [DEPT] courses in the Bulletin"** links out to the matched
+   course's department page in Brandeis's official Bulletin, and any core
+   requirements the course fulfills (Quantitative Reasoning, Writing
+   Intensive, etc.) show as small badges, linked to the Bulletin's
+   requirement-code glossary.
+5. **"➕ Add to list"** builds a running shortlist (up to 2 courses per
+   search) in the sidebar, which exports as a one-page PDF summary for an
+   advisor meeting — see [transfer_list_feature.py](transfer_list_feature.py).
+6. A persistent disclaimer makes clear this is an advisory estimate, not an
    official transfer credit determination.
 
 ## How it works — the pipeline
@@ -47,7 +55,8 @@ the student-facing half of the project:
 | 4 | [00_filter_untransferable.py](00_filter_untransferable.py), [02_filter_untransferable_v2.py](02_filter_untransferable_v2.py) | Removes courses that can never have a Brandeis equivalent (remedial, ESL, vocational/clinical programs, non-credit, orientation), so the matcher isn't wasting matches on courses that will never transfer. |
 | 5 | [04_match_equivalencies_v3.py](04_match_equivalencies_v3.py) | Embeds every course's title + description with an instruction-tuned sentence-transformer (`hkunlp/instructor-base`) and finds each community college course's top-3 most similar Brandeis courses by cosine similarity, tagging each as exact/strong/partial/weak. |
 | 6 | [05_evaluate_model.py](05_evaluate_model.py) | Measures matching accuracy/precision/recall against a hand-labeled test set, broken down by match type and by college, and surfaces the worst failures — this is what drives tuning of the matching thresholds. |
-| 7 | [streamlit_app.py](streamlit_app.py) | Serves the resulting database through the Course Equivalency Simulator, with Claude generating a human-friendly explanation for each match on demand. |
+| 7 | [06_scrape_bulletin.py](06_scrape_bulletin.py) | Scrapes the Brandeis Bulletin's ~90 subject pages for each course's core-requirement codes (QR, WI, OC, etc.) and builds a department → Bulletin subject-page lookup, both used for the "Official Bulletin" link and requirement badges in the app. See the script's docstring for why it reads the *provisional* Bulletin edition while the app links to the *current* one. |
+| 8 | [streamlit_app.py](streamlit_app.py) | Serves the resulting database through the Course Equivalency Simulator, with Claude generating a human-friendly explanation for each match on demand. |
 
 Other utilities: [view_db.py](view_db.py) is a quick CLI for inspecting
 `db/courses.db`; [title_cleaning](title_cleaning) normalizes course title
@@ -82,7 +91,14 @@ python 00_filter_untransferable.py
 python 02_filter_untransferable_v2.py
 python 04_match_equivalencies_v3.py
 python 05_evaluate_model.py
+python 06_scrape_bulletin.py
 ```
+
+`06_scrape_bulletin.py` is the odd one out: it doesn't depend on the scrape
+above it and can be re-run independently whenever the Bulletin's content
+changes. If it fails partway through the database write (e.g. `courses.db`
+open in another program), the scrape itself is checkpointed — retry with
+`python 06_scrape_bulletin.py --from-cache` instead of re-scraping.
 
 ## Deployment
 

@@ -14,6 +14,7 @@ env/
 transfer_courses*.xlsx
 *.csv
 scrape_history.json
+data/processed/bulletin_scrape_cache.json
 
 # Logs
 *.log
@@ -34,6 +35,7 @@ sanity check 2.py
 # IDE
 .vscode/
 .idea/
+*.sqbpro
 
 # OS
 .DS_Store

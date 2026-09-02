@@ -36,6 +36,12 @@ from transfer_list_feature import (
     reset_search_tracking,
     render_sidebar,
 )
+from bulletin_integration import (
+    get_bulletin_url,
+    get_requirement_codes,
+    REQUIREMENT_LABELS,
+    REQCODES_URL,
+)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # Resolved relative to this file's location (not the shell's cwd), so it works
@@ -433,6 +439,27 @@ def main():
             # on a single line instead.
             dept_html    = f"Dept: {r['brd_department']}" if r['brd_department'] else ""
             credits_html = f"&nbsp;·&nbsp; {r['brd_credits']} credits" if r['brd_credits'] else ""
+
+            # Core requirement chips (Quantitative Reasoning, Science, etc.) —
+            # a Brandeis match that also knocks out a gen-ed requirement is a
+            # real point in its favor, not just decoration. Codes/labels come
+            # from 06_scrape_bulletin.py via bulletin_integration.py.
+            req_codes = get_requirement_codes(r["brd_code"])
+            if req_codes:
+                chips = "".join(
+                    f'<span style="display:inline-block;font-size:10px;font-weight:700;'
+                    f'background:#eef2ff;color:#4338ca;border-radius:99px;padding:2px 8px;'
+                    f'margin-left:4px" title="{REQUIREMENT_LABELS.get(c, c.upper())}">{c.upper()}</span>'
+                    for c in sorted(req_codes)
+                )
+                req_html = (
+                    f'&nbsp;·&nbsp;Fulfills:{chips}'
+                    f' <a href="{REQCODES_URL}" target="_blank" style="font-size:10px;'
+                    f'color:#94a3b8;text-decoration:none" title="What do these mean?">ⓘ</a>'
+                )
+            else:
+                req_html = ""
+
             card_html = (
                 f'<div class="result-card card-{match_type}">'
                 f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'
@@ -442,7 +469,7 @@ def main():
                 f'<div class="arrow">→</div>'
                 f'<div style="font-size:16px;font-weight:700;color:{BRANDEIS_BLUE}">'
                 f'<strong>{r["brd_code"]}</strong> &nbsp;{r["brd_title"]}</div>'
-                f'<div style="font-size:12px;color:#94a3b8;margin-top:2px">{dept_html}{credits_html}</div>'
+                f'<div style="font-size:12px;color:#94a3b8;margin-top:2px">{dept_html}{credits_html}{req_html}</div>'
                 f'</div>'
                 f'<div>{badge_html(match_type)}</div>'
                 f'</div>'
@@ -460,7 +487,19 @@ def main():
             already_added_this_search = r["brd_code"] in st.session_state.added_this_search
             limit_reached = len(st.session_state.added_this_search) >= 2
 
-            _, add_col = st.columns([3, 1])
+            link_col, add_col = st.columns([3, 1])
+            with link_col:
+                bulletin_url = get_bulletin_url(r["brd_code"], r.get("brd_department", ""))
+                if bulletin_url:
+                    # Links to the department's page in the Bulletin, not the
+                    # exact course — the Bulletin has no per-course anchor to
+                    # link to (see 06_scrape_bulletin.py for why).
+                    st.markdown(
+                        f'<a href="{bulletin_url}" target="_blank" style="font-size:13px;'
+                        f'color:#1d4ed8;text-decoration:none;padding:6px 0;display:inline-block">'
+                        f'📖 See {r.get("brd_department", "")} courses in the Bulletin</a>',
+                        unsafe_allow_html=True,
+                    )
             with add_col:
                 if already_in_list:
                     st.markdown(
