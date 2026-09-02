@@ -140,10 +140,15 @@ st.markdown(f"""
   /* Arrow */
   .arrow {{ color: #94a3b8; font-size: 1.2rem; margin: 4px 0; }}
 
-  /* Hide streamlit branding */
+  /* Hide streamlit branding. Deliberately NOT hiding the whole <header> --
+     the sidebar's collapse/expand toggle lives inside that same element,
+     so doing that leaves a collapsed sidebar with no way to reopen it.
+     Target only the menu/deploy button instead. */
   #MainMenu {{ visibility: hidden; }}
   footer {{ visibility: hidden; }}
-  header {{ visibility: hidden; }}
+  [data-testid="stMainMenu"] {{ visibility: hidden; }}
+  [data-testid="stToolbarActions"] {{ visibility: hidden; }}
+  [data-testid="stAppDeployButton"] {{ visibility: hidden; }}
 </style>
 """, unsafe_allow_html=True)
 
