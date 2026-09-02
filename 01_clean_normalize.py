@@ -30,19 +30,37 @@ FLAG_CSV = os.path.join(BASE_DIR, "data", "processed", "flagged_for_review.csv")
 
 
 # ── BOILERPLATE PATTERNS TO STRIP ────────────────────────────────────────────
-# These patterns were found in the actual scraped data from BHCC and MassBay
+# Found in the actual scraped data across BHCC, MassBay, and Holyoke.
+#
+# Every pattern here matches a bounded, literal phrase -- none of them use an
+# open-ended ".*?" that searches forward for where the "real" content resumes.
+# An earlier version of the HELP-banner pattern did exactly that, guessing the
+# boundary via a lookahead for a "CODE-NUM TITLE"-shaped course code (works for
+# BHCC's "ACC-101 Principles..."). Holyoke's format is "ACC 111 - Principles..."
+# (hyphen after the number, not between code and number), which never satisfied
+# that lookahead anywhere in the real description -- so the non-greedy ".*?"
+# kept expanding all the way to end-of-string, silently deleting the entire
+# description for ~98% of Holyoke's courses. Bounded literal patterns can't
+# runaway like that: each one only ever removes the exact phrase it names.
 BOILERPLATE_PATTERNS = [
-    r"HELP\s+(?:College Catalog|[\d\-]+\s+Catalog)\s+[\d\-]+.*?(?=\w+\s*[-–]\s*\d+\w*\s+\w+|$)",
-    r"Print-Friendly Page.*?(?:window\))?",
-    r"Back to Top\s*\|.*?(?:window\))?",
-    r"Gen\.\s*Ed\.\s*Course\s*(?:Yes|No).*?(?:window\))?",
+    # Header banner, e.g. "HELP College Catalog 2026 - 2027" (BHCC, spaced
+    # year range) / "HELP 2025-2026 Catalog" (MassBay) / "HELP College
+    # Catalog 2026-2027" (Holyoke, tight year range).
+    r"HELP\s+(?:College\s+Catalog\s+\d{4}(?:\s*-\s*\d{4})?|\d{4}(?:\s*-\s*\d{4})?\s+Catalog)",
+    r"Print-Friendly Page",
+    r"Facebook this Page",
+    r"Tweet this Page",
+    r"Add to \w+ Favorites",
+    r"Click here for the \w+ \d{4} Class Offerings\.?",
+    r"Back to Top\s*\|",
+    r"Gen\.\s*Ed\.\s*Course\s*(?:Yes|No)",
     r"Mass Transfer\s*Course\s*(?:Yes|No)",
     r"Credits:\s*[\d.]+",
     r"\(opens a new window\)",
     r"Back to Top",
 ]
 
-BOILERPLATE_RE = re.compile("|".join(BOILERPLATE_PATTERNS), re.IGNORECASE | re.DOTALL)
+BOILERPLATE_RE = re.compile("|".join(BOILERPLATE_PATTERNS), re.IGNORECASE)
 
 
 def strip_boilerplate(text: str) -> str | None:
