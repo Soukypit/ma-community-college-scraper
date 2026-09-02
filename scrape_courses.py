@@ -631,8 +631,22 @@ RCC_SUBJECTS = [
 RCC_BASE = "https://www.rcc.mass.edu/catalog/current/courses"
 
 
+RCC_COURSE_HEADER_RE = re.compile(
+    r"([A-Z]{2,5}\s+\d{3,4}[A-Z]?)\.\s+(.+?)\s*\((\d+(?:\.\d+)?)\s*Credits?\)", re.I
+)
+# Roxbury crams the prereq note and the real description into ONE paragraph,
+# e.g. "PREREQUISITE: ENG 101<br><br>The fundamental principles of...". This
+# only ever extracts a short prereq snippet for the separate Prerequisites
+# column -- it never removes anything from the description text, since a
+# wrong guess here should degrade gracefully, not delete real content.
+RCC_PREREQ_SNIPPET_RE = re.compile(
+    r"^(Pre-?requisites?(?:\s+or\s+Corequisites?)?:?\s*[^.]*\.)", re.I
+)
+
+
 def scrape_rcc() -> list[dict]:
-    """Roxbury CC publishes one static HTML page per subject area."""
+    """Roxbury CC publishes one static HTML page per subject area, each a
+    Bootstrap accordion (one <div class="accordion-item"> per course)."""
     courses = []
 
     for subj in RCC_SUBJECTS:
@@ -644,32 +658,40 @@ def scrape_rcc() -> list[dict]:
             print(f"  [RCC] {subj}: {e}")
             continue
 
+        # select("h2") also matches the accordion's own subject-banner <h2>
+        # (e.g. a bare "BUS" heading, sibling of every accordion-item rather
+        # than nested inside one) -- filtered out below by requiring a full
+        # "CODE. TITLE. (N Credits)" match, which that banner never has.
         headers = s.select("h2")
-        print(f"  [RCC] {subj.upper()}: {len(headers)} courses")
 
+        kept = 0
         for h in headers:
             raw = h.get_text(" ", strip=True)
-            m   = re.match(
-                r"([A-Z]{2,5}\s+\d{3,4}[A-Z]?)\.\s+(.+?)\s*\((\d+(?:\.\d+)?)\s*Credits?\)",
-                raw, re.I,
-            )
-            if m:
-                code, title, credits = m.group(1), m.group(2), m.group(3)
-            else:
-                code    = _extract_code(raw)
-                credits = _extract_credits(raw)
-                title   = raw
+            m   = RCC_COURSE_HEADER_RE.match(raw)
+            if not m:
+                continue
+            code, title, credits = m.group(1), m.group(2), m.group(3)
+            kept += 1
 
+            # Siblings of a real course's h2 are its own accordion-collapse
+            # content only (find_next_siblings() is scoped to h's parent,
+            # the accordion-item div) -- unlike the banner h2 above, whose
+            # siblings are every OTHER course's accordion-item div on the
+            # page, which is exactly why that one has to be filtered out
+            # rather than handled here.
             desc_parts = []
             prereqs    = ""
             for sib in h.find_next_siblings():
                 if sib.name in ("h2", "h3"):
                     break
                 text = sib.get_text(" ", strip=True)
-                if re.match(r"Prerequisite", text, re.I):
-                    prereqs = text
-                elif text:
-                    desc_parts.append(text)
+                if not text:
+                    continue
+                desc_parts.append(text)
+                if not prereqs:
+                    pm = RCC_PREREQ_SNIPPET_RE.match(text)
+                    if pm:
+                        prereqs = pm.group(1)
 
             courses.append({
                 "College":       "Roxbury Community College",
@@ -679,6 +701,8 @@ def scrape_rcc() -> list[dict]:
                 "Description":   " ".join(desc_parts).strip(),
                 "Prerequisites": prereqs.strip(),
             })
+
+        print(f"  [RCC] {subj.upper()}: {kept}/{len(headers)} course headers")
 
     return courses
 
