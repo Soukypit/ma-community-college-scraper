@@ -241,35 +241,29 @@ def get_ai_explanation(cc_title, cc_desc, brd_title, brd_desc, match_type, score
             "partial": "This is a possible match that should be confirmed with an advisor.",
         }.get(match_type, "")
 
-        prompt = f"""You are a friendly and encouraging academic advisor at Brandeis University
-helping a transfer student understand how their community college course relates to a Brandeis course.
- 
+        prompt = f"""You are an academic advisor at Brandeis University helping a transfer student understand course equivalencies with this simulator.
+
+A community college course has been matched to a Brandeis course:
+
 COMMUNITY COLLEGE COURSE:
 Title: {cc_title}
 Description: {cc_desc or "No description available"}
- 
+
 BRANDEIS COURSE:
 Title: {brd_title}
 Description: {brd_desc or "No description available"}
- 
-Similarity: {score:.0%} ({match_type} match). {confidence_context}
- 
-Write a SHORT, WARM, HELPFUL explanation using this exact structure:
- 
-**Why these courses are related:** [1-2 sentences on shared content only — what topics they both cover]
- 
-**Good news for transfer credit:** [1 sentence on what this match means positively for the student]
- 
-**One thing to confirm with your advisor:** [1 specific, actionable question the student should ask — not a list of warnings]
- 
-Rules:
-- Be encouraging and solution-oriented, not skeptical
-- Do NOT say the score is misleading or wrong
-- Do NOT use words like "concerning", "problematic", "unlikely", "doubt"
-- Do NOT list multiple caveats or warnings
-- Keep the entire response under 120 words
-- End on a positive, actionable note
-- If the match is strong or exact, lead with confidence"""
+
+Match confidence: {match_type} ({score:.0%} similarity)
+
+In 2-3 sentences explain:
+1. Why these courses are considered equivalent (what content they share)
+2. Whether a Brandeis advisor would likely accept this transfer credit
+3. Any important caveats the student should know
+
+Be honest — if the match is partial, say so. Keep it conversational, helpful and friendly, as if you were speaking directly to the student. Avoid generic filler phrases like "Please consult your advisor" or "This is for informational purposes only.
+Also in your explanation take into account that this is a simulation, possible macthes are based on course titles and descriptions, and the final decision is made by Brandeis University.
+
+"""
 
         message = client.messages.create(
             model="claude-sonnet-4-6",

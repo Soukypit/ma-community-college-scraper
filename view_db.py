@@ -44,7 +44,7 @@ def preview_table(conn: sqlite3.Connection, table: str, limit: int, where: str |
 def main():
     parser = argparse.ArgumentParser(description="Preview tables in db/courses.db")
     parser.add_argument("--table", default=None, help="Table name to preview")
-    parser.add_argument("--limit", type=int, default=20, help="Row limit (default: 20)")
+    parser.add_argument("--limit", type=int, default=100, help="Row limit (default: 20)")
     parser.add_argument("--where", default=None, help="Optional SQL WHERE clause (no 'WHERE' keyword)")
     args = parser.parse_args()
 
